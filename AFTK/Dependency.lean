@@ -230,7 +230,29 @@ For large imports such as Mathlib, module restrictions are strongly recommended 
 
 /-- Help text for a query subcommand. -/
 def subcommandHelp (kind : QueryKind) : String :=
-  s!"{kind.description}\n\nUsage:\n  lake exe aftk {kind.command} [options] <module> <declaration>\n\nAliases:\n  {kind.aliases}\n\nArguments:\n  <module>       Lean module to import before running the query, e.g. Mathlib.Data.Nat.Basic.\n  <declaration>  Declaration to query, e.g. Nat.gcd.  Private declarations are resolved\n                 using <module>'s private namespace.\n\n{moduleFilterHelp}\n\nOutput:\n  By default, tab-separated rows: <module>\\t<declaration>.\n  With --jsonl, each row is a JSON object with `module` and `declaration` fields.\n\nExamples:\n  lake exe aftk {kind.command} Mathlib.Data.Nat.Basic Nat.gcd\n  lake exe aftk {kind.command} Mathlib.Data.Nat.Basic Nat.gcd --module 'Mathlib.Algebra.*'\n  lake exe aftk {kind.command} Mathlib.Data.Nat.Basic Nat.gcd --modules 'Mathlib.Algebra.*,Mathlib.Order.*'"
+  s!"{kind.description}
+
+Usage:
+  lake exe aftk {kind.command} [options] <module> <declaration>
+
+Aliases:
+  {kind.aliases}
+
+Arguments:
+  <module>       Lean module to import before running the query, e.g. Mathlib.Data.Nat.Basic.
+  <declaration>  Declaration to query, e.g. Nat.gcd.  Private declarations are resolved
+                 using <module>'s private namespace.
+
+{moduleFilterHelp}
+
+Output:
+  By default, tab-separated rows: <module>\\t<declaration>.
+  With --jsonl, each row is a JSON object with `module` and `declaration` fields.
+
+Examples:
+  lake exe aftk {kind.command} Mathlib.Data.Nat.Basic Nat.gcd
+  lake exe aftk {kind.command} Mathlib.Data.Nat.Basic Nat.gcd --module 'Mathlib.Algebra.*'
+  lake exe aftk {kind.command} Mathlib.Data.Nat.Basic Nat.gcd --modules 'Mathlib.Algebra.*,Mathlib.Order.*'"
 
 /-- The module associated with a declaration, if Lean recorded one. -/
 def moduleOf? (env : Environment) (declName : Name) : Option Name := do
