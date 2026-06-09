@@ -1,0 +1,11 @@
+name = "aftk"
+version = "0.1.0"
+defaultTargets = ["aftk"]
+
+[[lean_lib]]
+name = "AFTK"
+
+[[lean_exe]]
+name = "aftk"
+root = "Main"
+supportInterpreter = true
