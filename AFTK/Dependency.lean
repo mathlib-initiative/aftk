@@ -1,6 +1,7 @@
 module
 
 public import Lean
+public import AFTK.Server
 
 public section
 
@@ -185,26 +186,48 @@ def topLevelHelp : String :=
 "AFTK: dependency analysis for Lean declarations.
 
 Usage:
-  lake exe aftk <command> [options] <module> <declaration>
+  lake exe aftk deps [options] <module> <declaration>
+  lake exe aftk rdeps [options] <module> <declaration>
+  lake exe aftk diagnostics [options] <file>
+  lake exe aftk open [options] <file>
+  lake exe aftk restart <file>
+  lake exe aftk close <file>
+  lake exe aftk close --idle
+  lake exe aftk close --all
+  lake exe aftk gc [--aggressive]
+  lake exe aftk status
+  lake exe aftk shutdown [--force|--all-projects]
   lake exe aftk help <command>
   lake exe aftk --help
 
 Commands:
-  deps    Display declarations that are transitive dependencies of a declaration.
-  rdeps   Display declarations that transitively depend on a declaration.
+  deps          Display declarations that are transitive dependencies of a declaration.
+  rdeps         Display declarations that transitively depend on a declaration.
+  open          Warm up/open a Lean file worker in the project daemon.
+  diagnostics   Elaborate a Lean file and print diagnostics as JSON.
+  restart      Restart a file worker and reload imports/dependencies.
+  close         Release file workers (`<file>`, `--idle`, or `--all`).
+  gc            Run daemon resource cleanup now.
+  status        Show daemon/resource status.
+  shutdown      Stop project daemon(s) and workers.
 
 Global options:
   -h, --help   Show help.  Each subcommand also accepts --help.
 
-Output:
-  By default, results are printed as tab-separated rows:
+Dependency output:
+  By default, deps/rdeps results are printed as tab-separated rows:
     <module>\t<declaration>
-  Subcommands also support --jsonl for one JSON object per result.
+  deps/rdeps also support --jsonl for one JSON object per result.
+
+Diagnostics output:
+  diagnostics/open/close/gc/status/shutdown print one JSON response object.
+  diagnostics supports --transient/--close-after and --ttl-ms for multi-agent resource management.
 
 Notes:
   * Internal declarations are traversed but omitted from output.
   * Private declarations are included and printed with their user-facing names.
   * Module restrictions filter output only; traversal may still pass through other modules.
+  * The diagnostics daemon is per Lake project root and stores metadata in .lake/aftk/.
 
 Run `lake exe aftk <command> --help` for command-specific options and examples."
 
@@ -599,9 +622,16 @@ def run (args : List String) : IO UInt32 := do
           IO.println (subcommandHelp kind)
           return (0 : UInt32)
       | none =>
-          IO.eprintln s!"unknown command `{cmd}`\n\n{topLevelHelp}"
-          return (1 : UInt32)
+          if Server.isCommand cmd then
+            IO.println Server.cliHelp
+            return (0 : UInt32)
+          else
+            IO.eprintln s!"unknown command `{cmd}`\n\n{topLevelHelp}"
+            return (1 : UInt32)
   | cmd :: rest =>
+      if Server.isCommand cmd then
+        Server.runCli cmd rest
+      else
       match parseQueryKind cmd with
       | some kind =>
           match parseQueryArgs rest with
