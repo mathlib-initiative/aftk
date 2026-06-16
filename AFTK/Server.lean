@@ -19,7 +19,7 @@ open System
 open Std.Net
 
 /-- Current AFTK daemon protocol version. -/
-def protocolVersion : Nat := 2
+def protocolVersion : Nat := 3
 
 /-- Metadata persisted by a daemon in `.lake/aftk/server.json`. -/
 structure ServerMeta where
@@ -392,6 +392,31 @@ def diagnosticCodeJson : DiagnosticCode → Json
 def positionJson1 (p : Lsp.Position) : Json :=
   Json.mkObj [("line", toJson (p.line + 1)), ("column", toJson (p.character + 1))]
 
+/-- Convert a 1-based agent-facing line/column pair to an LSP position. -/
+def lspPositionFromLineColumn (line column : Nat) : Except String Lsp.Position := do
+  if line == 0 then
+    throw "line must be >= 1"
+  if column == 0 then
+    throw "column must be >= 1"
+  return { line := line - 1, character := column - 1 }
+
+/-- Parse a positive natural number. -/
+def parsePositiveNat (what raw : String) : Except String Nat := do
+  let some n := raw.toNat? | throw s!"invalid {what} `{raw}`"
+  if n == 0 then
+    throw s!"{what} must be >= 1"
+  return n
+
+/-- Parse `line:column` or `line,column`, using 1-based numbers. -/
+def parseLineColumnString (raw : String) : Except String (Nat × Nat) := do
+  let sep := if raw.contains ':' then ":" else ","
+  match raw.splitOn sep with
+  | [line, column] =>
+      let line ← parsePositiveNat "line" line
+      let column ← parsePositiveNat "column" column
+      return (line, column)
+  | _ => throw s!"invalid location `{raw}`; expected <line>:<column>"
+
 /-- Convert an LSP range to a 1-based agent-facing JSON object. -/
 def rangeJson1 (r : Range) : Json :=
   Json.mkObj [("start", positionJson1 r.start), ("end", positionJson1 r.end)]
@@ -409,6 +434,14 @@ def diagnosticJson (file : String) (includeRaw : Bool) (d : Diagnostic) : Json :
     | none => base
   let base := if includeRaw then base ++ [("raw", toJson d)] else base
   Json.mkObj base
+
+/-- Convert a plain tactic-goal response to an agent-facing JSON object. -/
+def plainGoalJson (g : PlainGoal) : Json :=
+  Json.mkObj [("rendered", toJson g.rendered), ("goals", toJson g.goals)]
+
+/-- Convert a plain term-goal response to an agent-facing JSON object. -/
+def plainTermGoalJson (g : PlainTermGoal) : Json :=
+  Json.mkObj [("goal", toJson g.goal), ("range", rangeJson1 g.range)]
 
 /-- Configuration for a single Lean worker process. -/
 structure LspWorker where
@@ -682,6 +715,51 @@ def resolveLocalModule? (root : FilePath) (moduleName : String) : IO (Option Fil
   if ← path.pathExists then
     return some (← IO.FS.realPath path)
   return none
+
+/-- Ask Lake for the project's source search path. This is needed when AFTK is run directly
+rather than through `lake env`, especially for libraries with non-default `srcDir`s. -/
+def lakeEnvSrcSearchPath? (root : FilePath) : IO (Option Lean.SearchPath) := do
+  try
+    let out ← IO.Process.output {
+      cmd := "lake"
+      args := #["env", "printenv", "LEAN_SRC_PATH"]
+      cwd := some root
+    }
+    if out.exitCode != 0 then
+      return none
+    let raw := out.stdout.trimAscii.toString
+    if raw.isEmpty then
+      return none
+    return some (System.SearchPath.parse raw)
+  catch _ =>
+    return none
+
+/-- Source search path for resolving project module names. -/
+def projectSrcSearchPath (root : FilePath) : IO Lean.SearchPath := do
+  let inherited ← getSrcSearchPath
+  let fallback : Lean.SearchPath := [root]
+  match ← lakeEnvSrcSearchPath? root with
+  | some lakePath => return lakePath ++ inherited ++ fallback
+  | none => return inherited ++ fallback
+
+/-- Heuristic for accepting a file path anywhere a module name is expected. -/
+def looksLikeLeanFilePath (s : String) : Bool :=
+  isLeanFileName s || containsSubstring s "/"
+
+/-- Resolve a module name (or an explicit `.lean` path) to a source file. -/
+def resolveModuleOrFile (root : FilePath) (moduleOrFile : String) : IO FilePath := do
+  if looksLikeLeanFilePath moduleOrFile then
+    return ← realFilePath (FilePath.mk moduleOrFile)
+  if moduleOrFile.trimAscii.isEmpty then
+    throw <| IO.userError "module name must not be empty"
+  if let some path ← resolveLocalModule? root moduleOrFile then
+    return path
+  let modName := moduleOrFile.toName
+  let sp ← projectSrcSearchPath root
+  match ← sp.findModuleWithExt "lean" modName with
+  | some path => IO.FS.realPath path
+  | none =>
+      throw <| IO.userError s!"could not find source for module `{moduleOrFile}` in project source search path"
 
 /-- Crude import-line parser sufficient for source freshness tracking. -/
 def parseImportModulesFromText (text : String) : Array String := Id.run do
@@ -1039,6 +1117,14 @@ def Manager.maybeRestartForDiagnostics (m : Manager) (ofile : OpenFile) (refresh
     | some dep => return (← m.restartFileFromDisk ofile, some s!"stale dependency: {dep}")
     | none => return (ofile, none)
 
+/-- Wait until diagnostics for the open file's current version have been produced. -/
+def OpenFile.waitForDiagnosticsVersion (ofile : OpenFile) (timeoutMs : Nat) : IO Nat := do
+  let version ← ofile.versionRef.get
+  let waitParams : WaitForDiagnosticsParams := { uri := ofile.uri, version }
+  let promise ← ofile.worker.request "textDocument/waitForDiagnostics" (toJson waitParams)
+  discard <| waitPromiseTimeout promise timeoutMs
+  return version
+
 /-- Diagnostics implementation; callers may wrap it with close-after cleanup. -/
 partial def Manager.diagnosticsCore (m : Manager) (file : String) (timeoutMs : Nat := 30000) (includeRaw : Bool := false)
     (retry := true) (refresh := false) (ttlMs? : Option Nat := none) : IO Json := do
@@ -1104,6 +1190,83 @@ partial def Manager.diagnostics (m : Manager) (file : String) (timeoutMs : Nat :
         let path ← try realFilePath (FilePath.mk file) catch _ => absolutize (FilePath.mk file)
         if let some ofile ← m.getOpen? path then
           discard <| m.closeOpenFile ofile
+      catch _ => pure ()
+
+/-- Query plain term and tactic goals at a 1-based source location in a module. -/
+partial def Manager.goalsCore (m : Manager) (moduleName : String) (pos : Lsp.Position)
+    (timeoutMs : Nat := 30000) (retry := true) (refresh := false) (ttlMs? : Option Nat := none) : IO Json := do
+  m.touch
+  let path ← resolveModuleOrFile m.projectRoot moduleName
+  let ofile ← m.ensureOpen path.toString ttlMs?
+  ofile.busyRef.modify (· + 1)
+  try
+    let ofile ← m.syncFileFromDisk ofile
+    let restartResult ← m.maybeRestartForDiagnostics ofile refresh
+    let ofile := restartResult.1
+    let restartReason? := restartResult.2
+    let status ← ofile.worker.statusRef.get
+    match status with
+    | .terminated 2 =>
+        if retry then
+          discard <| m.restartFileFromDisk ofile
+          Manager.goalsCore m moduleName pos timeoutMs false false ttlMs?
+        else
+          throw <| IO.userError "worker requested restart after import/header change"
+    | .terminated code =>
+        throw <| IO.userError s!"worker exited with code {code}"
+    | .crashed msg =>
+        throw <| IO.userError msg
+    | .running =>
+        let version ← try
+          ofile.waitForDiagnosticsVersion timeoutMs
+        catch e =>
+          let status ← ofile.worker.statusRef.get
+          match status with
+          | .terminated 2 =>
+              if retry then
+                discard <| m.restartFileFromDisk ofile
+                return (← Manager.goalsCore m moduleName pos timeoutMs false false ttlMs?)
+              else
+                throw e
+          | _ => throw e
+        ofile.updateImportSnapshot m.projectRoot
+        let posParams : TextDocumentPositionParams := { textDocument := { uri := ofile.uri }, position := pos }
+        let tacticParams : PlainGoalParams := { toTextDocumentPositionParams := posParams }
+        let termParams : PlainTermGoalParams := { toTextDocumentPositionParams := posParams }
+        let tacticPromise ← ofile.worker.request "$/lean/plainGoal" (toJson tacticParams)
+        let termPromise ← ofile.worker.request "$/lean/plainTermGoal" (toJson termParams)
+        let tacticJson ← waitPromiseTimeout tacticPromise timeoutMs
+        let termJson ← waitPromiseTimeout termPromise timeoutMs
+        let tacticGoal? ← exceptToIO <| fromJson? (α := Option PlainGoal) tacticJson
+        let termGoal? ← exceptToIO <| fromJson? (α := Option PlainTermGoal) termJson
+        let fields := [
+          ("module", toJson moduleName),
+          ("file", toJson ofile.path.toString),
+          ("uri", toJson ofile.uri),
+          ("version", toJson version),
+          ("position", positionJson1 pos),
+          ("tacticGoals", tacticGoal?.map plainGoalJson |>.getD Json.null),
+          ("termGoal", termGoal?.map plainTermGoalJson |>.getD Json.null)]
+        let fields := match restartReason? with
+          | some reason => fields ++ [("restarted", toJson true), ("restartReason", toJson reason)]
+          | none => fields
+        return Json.mkObj fields
+  finally
+    ofile.busyRef.modify fun n => if n == 0 then 0 else n - 1
+
+/-- Query goals for a module, auto-opening its source file if needed. -/
+partial def Manager.goals (m : Manager) (moduleName : String) (line column : Nat) (timeoutMs : Nat := 30000)
+    (retry := true) (refresh := false) (closeAfter := false) (ttlMs? : Option Nat := none) : IO Json := do
+  let pos ← exceptToIO <| lspPositionFromLineColumn line column
+  let path? ← try some <$> resolveModuleOrFile m.projectRoot moduleName catch _ => pure none
+  try
+    Manager.goalsCore m moduleName pos timeoutMs retry refresh ttlMs?
+  finally
+    if closeAfter then
+      try
+        if let some path := path? then
+          if let some ofile ← m.getOpen? path then
+            discard <| m.closeOpenFile ofile
       catch _ => pure ()
 
 /-- Explicitly restart a file worker, opening the file if necessary. -/
@@ -1242,6 +1405,15 @@ def Manager.handle (m : Manager) (req : Json) : IO Json := do
         let closeAfter := (getBoolField? params "closeAfter" |>.getD false) || (getBoolField? params "transient" |>.getD false)
         let ttlMs? := getNatField? params "ttlMs"
         return okResponse (← m.diagnostics file timeoutMs includeRaw (refresh := refresh) (closeAfter := closeAfter) (ttlMs? := ttlMs?))
+    | "goals" =>
+        let moduleName ← exceptToIO <| getStringField params "module"
+        let line ← exceptToIO <| getObjValAs? Nat params "line"
+        let column ← exceptToIO <| getObjValAs? Nat params "column"
+        let timeoutMs := getNatField? params "timeoutMs" |>.getD 30000
+        let refresh := getBoolField? params "refresh" |>.getD false
+        let closeAfter := (getBoolField? params "closeAfter" |>.getD false) || (getBoolField? params "transient" |>.getD false)
+        let ttlMs? := getNatField? params "ttlMs"
+        return okResponse (← m.goals moduleName line column timeoutMs (refresh := refresh) (closeAfter := closeAfter) (ttlMs? := ttlMs?))
     | "restart" | "refresh" =>
         let file ← exceptToIO <| getStringField params "file"
         return okResponse (← m.restartCommand file)
@@ -1583,6 +1755,8 @@ def cliHelp : String :=
 Commands:
   open [options] <file>          Warm up/open a Lean file worker (open options precede file).
   diagnostics [options] <file>   Elaborate file and print diagnostics as JSON.
+  goals [options] <module> <line> <column>
+                                Return term/tactic goals at a 1-based module location.
   restart <file>                 Restart a file worker and reload imports/dependencies.
   close <file>                   Release a file worker.
   close --idle                   Close idle/expired workers now.
@@ -1594,8 +1768,8 @@ Commands:
 Options:
   --timeout-ms <n>               Diagnostics/request timeout.
   --raw-lsp                      Include raw LSP diagnostics.
-  --refresh                      Restart worker before diagnostics.
-  --transient | --close-after    Close the worker after diagnostics.
+  --refresh                      Restart worker before diagnostics/goals.
+  --transient | --close-after    Close the worker after the request.
   --ttl-ms <n>                   Set/renew a worker lease.
   --dependency-build-mode <m>    always | once | never (open only).
 "
@@ -1643,6 +1817,87 @@ partial def runDiagnosticsCli (args : List String) : IO UInt32 := do
         | none => []
       let params := Json.mkObj (([("file", toJson file), ("timeoutMs", toJson timeoutMs), ("includeRawLsp", toJson raw), ("refresh", toJson refresh), ("closeAfter", toJson closeAfter)] : List (String × Json)) ++ fields)
       printDaemonResponse (← sendToDaemon md "diagnostics" params (timeoutMs + 5000))
+
+/-- Run the goals CLI command. -/
+partial def runGoalsCli (args : List String) : IO UInt32 := do
+  let finalize (timeoutMs : Nat) (refresh closeAfter : Bool) (ttlMs? : Option Nat)
+      (line? column? : Option Nat) (positionals : Array String) : Except String (Nat × Bool × Bool × Option Nat × String × Nat × Nat) := do
+    match positionals.toList with
+    | [moduleName] =>
+        match line?, column? with
+        | some line, some column => return (timeoutMs, refresh, closeAfter, ttlMs?, moduleName, line, column)
+        | some _, none => throw "missing --column for goals location"
+        | none, some _ => throw "missing --line for goals location"
+        | none, none => throw "goals requires <module> <line> <column> or <module> <line>:<column>"
+    | [moduleName, loc] =>
+        if line?.isSome || column?.isSome then
+          throw "do not combine positional location with --line/--column"
+        let (line, column) ← parseLineColumnString loc
+        return (timeoutMs, refresh, closeAfter, ttlMs?, moduleName, line, column)
+    | [moduleName, lineRaw, columnRaw] =>
+        if line?.isSome || column?.isSome then
+          throw "do not combine positional location with --line/--column"
+        let line ← parsePositiveNat "line" lineRaw
+        let column ← parsePositiveNat "column" columnRaw
+        return (timeoutMs, refresh, closeAfter, ttlMs?, moduleName, line, column)
+    | [] => throw "goals requires <module> and a location"
+    | _ => throw "too many positional arguments for goals"
+  let rec parseGoals (args : List String) (timeoutMs : Nat) (refresh closeAfter : Bool)
+      (ttlMs? : Option Nat) (line? column? : Option Nat) (positionals : Array String)
+      : Except String (Nat × Bool × Bool × Option Nat × String × Nat × Nat) := do
+    match args with
+    | [] => finalize timeoutMs refresh closeAfter ttlMs? line? column? positionals
+    | "--timeout-ms" :: rest => do
+        let (v, rest) ← takeOptionValue "--timeout-ms" rest
+        let some n := v.toNat? | .error s!"invalid timeout `{v}`"
+        parseGoals rest n refresh closeAfter ttlMs? line? column? positionals
+    | "--refresh" :: rest => parseGoals rest timeoutMs true closeAfter ttlMs? line? column? positionals
+    | "--transient" :: rest => parseGoals rest timeoutMs refresh true ttlMs? line? column? positionals
+    | "--close-after" :: rest => parseGoals rest timeoutMs refresh true ttlMs? line? column? positionals
+    | "--ttl-ms" :: rest => do
+        let (v, rest) ← takeOptionValue "--ttl-ms" rest
+        let some n := v.toNat? | .error s!"invalid ttl `{v}`"
+        parseGoals rest timeoutMs refresh closeAfter (some n) line? column? positionals
+    | "--line" :: rest => do
+        let (v, rest) ← takeOptionValue "--line" rest
+        parseGoals rest timeoutMs refresh closeAfter ttlMs? (some (← parsePositiveNat "line" v)) column? positionals
+    | "--column" :: rest => do
+        let (v, rest) ← takeOptionValue "--column" rest
+        parseGoals rest timeoutMs refresh closeAfter ttlMs? line? (some (← parsePositiveNat "column" v)) positionals
+    | "--position" :: rest | "--pos" :: rest => do
+        let (v, rest) ← takeOptionValue "--position" rest
+        let (line, column) ← parseLineColumnString v
+        parseGoals rest timeoutMs refresh closeAfter ttlMs? (some line) (some column) positionals
+    | arg :: rest =>
+        if arg.startsWith "--line=" then
+          parseGoals rest timeoutMs refresh closeAfter ttlMs? (some (← parsePositiveNat "line" ((arg.drop "--line=".length).toString))) column? positionals
+        else if arg.startsWith "--column=" then
+          parseGoals rest timeoutMs refresh closeAfter ttlMs? line? (some (← parsePositiveNat "column" ((arg.drop "--column=".length).toString))) positionals
+        else if arg.startsWith "--position=" then
+          let (line, column) ← parseLineColumnString ((arg.drop "--position=".length).toString)
+          parseGoals rest timeoutMs refresh closeAfter ttlMs? (some line) (some column) positionals
+        else if arg.startsWith "--pos=" then
+          let (line, column) ← parseLineColumnString ((arg.drop "--pos=".length).toString)
+          parseGoals rest timeoutMs refresh closeAfter ttlMs? (some line) (some column) positionals
+        else if arg.startsWith "-" then
+          .error s!"unknown goals option `{arg}`"
+        else
+          parseGoals rest timeoutMs refresh closeAfter ttlMs? line? column? (positionals.push arg)
+  match parseGoals args 30000 false false none none none #[] with
+  | .error e => IO.eprintln s!"error: {e}\n\n{cliHelp}"; return 1
+  | .ok (timeoutMs, refresh, closeAfter, ttlMs?, moduleName, line, column) =>
+      let root ←
+        if looksLikeLeanFilePath moduleName then
+          findProjectRoot (some (FilePath.mk moduleName))
+        else
+          findProjectRoot none
+      let some md ← getDaemon root true | throw <| IO.userError "failed to start daemon"
+      let fields := match ttlMs? with
+        | some ttlMs => [("ttlMs", toJson ttlMs)]
+        | none => []
+      let params := Json.mkObj (([("module", toJson moduleName), ("line", toJson line), ("column", toJson column),
+        ("timeoutMs", toJson timeoutMs), ("refresh", toJson refresh), ("closeAfter", toJson closeAfter)] : List (String × Json)) ++ fields)
+      printDaemonResponse (← sendToDaemon md "goals" params (timeoutMs + 5000))
 
 /-- Run visible and hidden daemon-related CLI commands. -/
 partial def runCli (cmd : String) (args : List String) : IO UInt32 := do
@@ -1695,6 +1950,8 @@ partial def runCli (cmd : String) (args : List String) : IO UInt32 := do
       runDiagnosticsCli args
   | "diag" =>
       runDiagnosticsCli args
+  | "goals" | "goal" =>
+      runGoalsCli args
   | "restart" | "refresh" =>
       match args with
       | [file] =>
@@ -1762,7 +2019,8 @@ partial def runCli (cmd : String) (args : List String) : IO UInt32 := do
 /-- True for top-level CLI commands handled by `AFTK.Server`. -/
 def isCommand (cmd : String) : Bool :=
   cmd == "daemon" || cmd == "open" || cmd == "diagnostics" || cmd == "diag" ||
-    cmd == "restart" || cmd == "refresh" || cmd == "close" || cmd == "gc" || cmd == "status" || cmd == "shutdown"
+    cmd == "goals" || cmd == "goal" || cmd == "restart" || cmd == "refresh" ||
+    cmd == "close" || cmd == "gc" || cmd == "status" || cmd == "shutdown"
 
 end Server
 end AFTK

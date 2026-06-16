@@ -7,6 +7,7 @@ lake exe aftk deps [options] <module> <declaration>
 lake exe aftk rdeps [options] <module> <declaration>
 
 lake exe aftk diagnostics [options] <file>
+lake exe aftk goals [options] <module> <line> <column>
 lake exe aftk open [options] <file>
 lake exe aftk restart <file>
 lake exe aftk close <file>
@@ -44,10 +45,14 @@ lake exe aftk rdeps Mathlib.Data.Nat.Basic Nat.gcd --modules 'Mathlib.Algebra.*,
 lake exe aftk diagnostics A/B/C.lean
 lake exe aftk diagnostics A/B/C.lean --refresh
 lake exe aftk diagnostics A/B/C.lean --transient
+lake exe aftk goals A.B.C 12 5
+lake exe aftk goals A.B.C 12:5
 lake exe aftk open --ttl-ms 600000 A/B/C.lean
 ```
 
-The daemon tracks each worker's import closure and local project source imports. If a tracked dependency changes on disk, the next `diagnostics` call restarts the affected worker before elaborating. `open` is an optional warmup hint. `restart` reloads one file worker and its imports/dependencies. `close` releases one file worker. `--transient` / `--close-after` runs diagnostics and releases the worker immediately.
+`goals` uses the same daemon/worker lifecycle and returns both Lean LSP plain tactic goals (`tacticGoals`) and plain term goals (`termGoal`) at a 1-based line/column in the given module.
+
+The daemon tracks each worker's import closure and local project source imports. If a tracked dependency changes on disk, the next `diagnostics` or `goals` call restarts the affected worker before elaborating. `open` is an optional warmup hint. `restart` reloads one file worker and its imports/dependencies. `close` releases one file worker. `--transient` / `--close-after` runs diagnostics/goals and releases the worker immediately.
 
 Resource management is built in for multi-agent use:
 

@@ -189,6 +189,7 @@ Usage:
   lake exe aftk deps [options] <module> <declaration>
   lake exe aftk rdeps [options] <module> <declaration>
   lake exe aftk diagnostics [options] <file>
+  lake exe aftk goals [options] <module> <line> <column>
   lake exe aftk open [options] <file>
   lake exe aftk restart <file>
   lake exe aftk close <file>
@@ -205,6 +206,7 @@ Commands:
   rdeps         Display declarations that transitively depend on a declaration.
   open          Warm up/open a Lean file worker in the project daemon.
   diagnostics   Elaborate a Lean file and print diagnostics as JSON.
+  goals        Return term/tactic goals at a 1-based module location.
   restart      Restart a file worker and reload imports/dependencies.
   close         Release file workers (`<file>`, `--idle`, or `--all`).
   gc            Run daemon resource cleanup now.
@@ -220,8 +222,8 @@ Dependency output:
   deps/rdeps also support --jsonl for one JSON object per result.
 
 Diagnostics output:
-  diagnostics/open/close/gc/status/shutdown print one JSON response object.
-  diagnostics supports --transient/--close-after and --ttl-ms for multi-agent resource management.
+  diagnostics/goals/open/close/gc/status/shutdown print one JSON response object.
+  diagnostics/goals support --transient/--close-after and --ttl-ms for multi-agent resource management.
 
 Notes:
   * Internal declarations are traversed but omitted from output.

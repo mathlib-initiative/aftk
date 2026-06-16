@@ -115,6 +115,66 @@ assert r["resourceConfig"]["maxWorkersPerProject"] == 8
 '
 (cd "$p" && "$AFTK_BIN" shutdown >/dev/null)
 
+printf 'test: goals returns tactic and term goals by module location\n'
+p=$(make_project)
+mkdir -p "$p/Tmp"
+cat > "$p/Tmp/Goal.lean" <<'EOF'
+theorem t (p q : Prop) (hp : p) : q → p := by
+  intro hq
+  exact hp
+
+def n : Nat :=
+  1
+EOF
+(cd "$p" && "$AFTK_BIN" goals Tmp.Goal 2 3 --timeout-ms 20000 > tactic-goals.json)
+(cd "$p" && "$AFTK_BIN" goals Tmp.Goal 6:3 --timeout-ms 20000 --transient > term-goal.json)
+(cd "$p" && "$AFTK_BIN" status > goals-status.json)
+assert_json "$p/tactic-goals.json" '
+assert data["ok"]
+r = data["result"]
+assert r["module"] == "Tmp.Goal"
+assert r["position"] == {"line": 2, "column": 3}
+assert r["tacticGoals"] is not None
+assert "⊢ q → p" in r["tacticGoals"]["rendered"]
+assert r["termGoal"] is None
+'
+assert_json "$p/term-goal.json" '
+assert data["ok"]
+r = data["result"]
+assert r["termGoal"] is not None
+assert "⊢ Nat" in r["termGoal"]["goal"]
+assert r["termGoal"]["range"]["start"] == {"line": 6, "column": 3}
+'
+assert_json "$p/goals-status.json" 'assert data["ok"]; assert data["result"]["openFileCount"] == 0'
+(cd "$p" && "$AFTK_BIN" shutdown >/dev/null)
+
+printf 'test: goals resolves custom srcDir modules without inherited LEAN_SRC_PATH\n'
+p=$(mktemp -d /tmp/aftk-test-XXXXXX)
+temps+=("$p")
+cat > "$p/lakefile.toml" <<'EOF'
+name = "tmp"
+version = "0.1.0"
+defaultTargets = ["Tmp"]
+[[lean_lib]]
+name = "Tmp"
+srcDir = "src"
+EOF
+cp "$TOOLCHAIN" "$p/lean-toolchain"
+mkdir -p "$p/src/Tmp"
+cat > "$p/src/Tmp/Custom.lean" <<'EOF'
+theorem custom (p q : Prop) (hp : p) : q → p := by
+  intro hq
+  exact hp
+EOF
+(cd "$p" && env -u LEAN_SRC_PATH "$AFTK_BIN" goals Tmp.Custom 2 3 --timeout-ms 20000 --transient > custom-goals.json)
+assert_json "$p/custom-goals.json" '
+assert data["ok"]
+r = data["result"]
+assert r["file"].endswith("src/Tmp/Custom.lean")
+assert r["tacticGoals"]["goals"] == ["p q : Prop\nhp : p\n⊢ q → p"]
+'
+(cd "$p" && "$AFTK_BIN" shutdown >/dev/null)
+
 printf 'test: default diagnostics builds missing local dependencies\n'
 p=$(make_project)
 cat > "$p/Tmp/Dep.lean" <<'EOF'
