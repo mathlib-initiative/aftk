@@ -4,7 +4,7 @@ public import Lean
 public import Lean.Data.Lsp
 public import Lean.Data.Lsp.Communication
 public import Lean.Server.Utils
-public import Std.Internal.Async.TCP
+public import Std.Async.TCP
 
 public section
 
@@ -1273,7 +1273,7 @@ def findNewline? (bytes : ByteArray) : Option Nat := Id.run do
   return none
 
 /-- Read all bytes from a TCP client until EOF. -/
-partial def tcpReadAll (client : Std.Internal.IO.Async.TCP.Socket.Client) : IO ByteArray := do
+partial def tcpReadAll (client : Std.Async.TCP.Socket.Client) : IO ByteArray := do
   let rec loop (acc : ByteArray) : IO ByteArray := do
     let chunk? ← (client.recv? 4096).block
     match chunk? with
@@ -1282,7 +1282,7 @@ partial def tcpReadAll (client : Std.Internal.IO.Async.TCP.Socket.Client) : IO B
   loop ByteArray.empty
 
 /-- Read one newline-terminated request from a TCP client. The newline is not included. -/
-partial def tcpReadRequestLine (client : Std.Internal.IO.Async.TCP.Socket.Client) : IO ByteArray := do
+partial def tcpReadRequestLine (client : Std.Async.TCP.Socket.Client) : IO ByteArray := do
   let rec loop (acc : ByteArray) : IO ByteArray := do
     let chunk? ← (client.recv? 4096).block
     match chunk? with
@@ -1294,12 +1294,12 @@ partial def tcpReadRequestLine (client : Std.Internal.IO.Async.TCP.Socket.Client
   loop ByteArray.empty
 
 /-- Send all bytes through a TCP client, bounding time spent on stale clients. -/
-def tcpSendString (client : Std.Internal.IO.Async.TCP.Socket.Client) (s : String) : IO Unit := do
+def tcpSendString (client : Std.Async.TCP.Socket.Client) (s : String) : IO Unit := do
   let task ← IO.asTask ((client.send s.toUTF8).block)
   discard <| waitIOTaskTimeout task 5000
 
 /-- Handle a single TCP client connection. -/
-def handleTcpClient (token : String) (m : Manager) (client : Std.Internal.IO.Async.TCP.Socket.Client) : IO Unit := do
+def handleTcpClient (token : String) (m : Manager) (client : Std.Async.TCP.Socket.Client) : IO Unit := do
   let bytes ← tcpReadRequestLine client
   let response ← try
     let raw ← match String.fromUTF8? bytes with
@@ -1323,7 +1323,7 @@ partial def runDaemon (root : FilePath) (token : String) : IO UInt32 := do
   IO.FS.createDirAll (aftkDir root)
   let logHandle ← IO.FS.Handle.mk (logPath root) IO.FS.Mode.append
   let _ ← IO.setStderr (IO.FS.Stream.ofHandle logHandle)
-  let server ← Std.Internal.IO.Async.TCP.Socket.Server.mk
+  let server ← Std.Async.TCP.Socket.Server.mk
   let addr : SocketAddress := SocketAddress.v4 { addr := IPv4Addr.ofParts 127 0 0 1, port := 0 }
   server.bind addr
   server.listen 64
@@ -1368,7 +1368,7 @@ partial def runDaemon (root : FilePath) (token : String) : IO UInt32 := do
 
 /-- Send one JSON request to a daemon described by metadata. -/
 def sendToDaemon (md : ServerMeta) (method : String) (params : Json) (timeoutMs : Nat := 30000) : IO Json := do
-  let client ← Std.Internal.IO.Async.TCP.Socket.Client.mk
+  let client ← Std.Async.TCP.Socket.Client.mk
   let port : UInt16 := md.port.toUInt16
   let addr : SocketAddress := SocketAddress.v4 { addr := IPv4Addr.ofParts 127 0 0 1, port := port }
   (client.connect addr).block
