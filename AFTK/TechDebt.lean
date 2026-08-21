@@ -373,6 +373,14 @@ partial def syntaxContainsIdent (stx : Syntax) (value : Name) : Bool :=
 def syntaxContainsNameToken (stx : Syntax) (value : Name) : Bool :=
   syntaxContainsIdent stx value || syntaxContainsAtom stx value.toString
 
+/-- Return the leftmost identifier or parser keyword in a syntax tree. -/
+partial def firstNameToken? (stx : Syntax) : Option Name :=
+  match stx with
+  | .ident _ _ name _ => some name.eraseMacroScopes
+  | .atom _ atom => some atom.toName
+  | .node _ _ args => args.findSome? firstNameToken?
+  | _ => none
+
 /-- Return the leftmost atom in a syntax tree. -/
 partial def firstAtom? (stx : Syntax) : Option String :=
   match stx with
@@ -434,17 +442,17 @@ def setOptionKind? (option : SetOptionSyntax) : Option Kind :=
   else
     none
 
-/-- True when an attribute instance contains both given identifiers. -/
+/-- True when an attribute has the given name and contains the given argument. -/
 partial def hasAttributeWithArgument (stx : Syntax) (attrName argument : Name) : Bool :=
-  if stx.isOfKind ``Lean.Parser.Term.attrInstance then
-    syntaxContainsNameToken stx attrName && syntaxContainsNameToken stx argument
+  if stx.isOfKind ``Lean.Parser.Term.attrInstance && stx.getNumArgs > 1 then
+    firstNameToken? stx[1] == some attrName && syntaxContainsNameToken stx[1] argument
   else
     stx.getArgs.any (hasAttributeWithArgument · attrName argument)
 
 /-- True when an attribute instance contains the given attribute identifier. -/
 partial def hasAttribute (stx : Syntax) (attrName : Name) : Bool :=
-  if stx.isOfKind ``Lean.Parser.Term.attrInstance then
-    syntaxContainsNameToken stx attrName
+  if stx.isOfKind ``Lean.Parser.Term.attrInstance && stx.getNumArgs > 1 then
+    firstNameToken? stx[1] == some attrName
   else
     stx.getArgs.any (hasAttribute · attrName)
 
@@ -461,6 +469,34 @@ def commandAttributes? (stx : Syntax) : Option Syntax :=
 def isDeclarationKind (stx : Syntax) (kind : SyntaxNodeKind) : Bool :=
   stx.isOfKind kind ||
     (stx.isOfKind ``Lean.Parser.Command.declaration && stx.getArgs.any (·.isOfKind kind))
+
+/-- True for an `@[expose] public section`, based on the dedicated section-header slots. -/
+def isExposedPublicSection (stx : Syntax) : Bool :=
+  if stx.isOfKind ``Lean.Parser.Command.section && stx.getNumArgs > 0 then
+    let header := stx[0]
+    header.isOfKind ``Lean.Parser.Command.sectionHeader && header.getNumArgs > 1 &&
+      !header[0].isNone && !header[1].isNone
+  else
+    false
+
+/-- True when an `openDecl` opens a namespace, without considering selector identifiers. -/
+def openDeclContainsNamespace (stx : Syntax) (namespaceName : Name) : Bool :=
+  if stx.isOfKind ``Lean.Parser.Command.openHiding ||
+      stx.isOfKind ``Lean.Parser.Command.openRenaming ||
+      stx.isOfKind ``Lean.Parser.Command.openOnly then
+    stx.getNumArgs > 0 && stx[0].isIdent &&
+      stx[0].getId.eraseMacroScopes == namespaceName
+  else if stx.isOfKind ``Lean.Parser.Command.openSimple then
+    stx.getNumArgs > 0 && syntaxContainsIdent stx[0] namespaceName
+  else if stx.isOfKind ``Lean.Parser.Command.openScoped then
+    stx.getNumArgs > 1 && syntaxContainsIdent stx[1] namespaceName
+  else
+    false
+
+/-- True when an `open` command opens the given namespace. -/
+def openCommandContainsNamespace (stx : Syntax) (namespaceName : Name) : Bool :=
+  stx.isOfKind ``Lean.Parser.Command.open && stx.getNumArgs > 1 &&
+    openDeclContainsNamespace stx[1] namespaceName
 
 /-- True when a `simp`/`dsimp` syntax enables the `instances` configuration. -/
 partial def enablesInstances (stx : Syntax) : Bool :=
@@ -492,14 +528,12 @@ def commandMarkers (stx : Syntax) : Array (Kind × Syntax) := Id.run do
     markers := markers.push (.unlockLimits, head)
   if startsWithAtom head "#adaptation_note" then
     markers := markers.push (.adaptationNote, head)
-  if head.isOfKind ``Lean.Parser.Command.section &&
-      syntaxContainsNameToken head `expose && syntaxContainsAtom head "public" then
+  if isExposedPublicSection head then
     markers := markers.push (.exposePublic, head)
-  if head.isOfKind ``Lean.Parser.Command.open then
-    if syntaxContainsIdent head `Fin.CommRing then
-      markers := markers.push (.finCommRing, head)
-    if syntaxContainsIdent head `Fin.NatCast then
-      markers := markers.push (.finNatCast, head)
+  if openCommandContainsNamespace head `Fin.CommRing then
+    markers := markers.push (.finCommRing, head)
+  if openCommandContainsNamespace head `Fin.NatCast then
+    markers := markers.push (.finNatCast, head)
   if isDeclarationKind head ``Lean.Parser.Command.axiom then
     markers := markers.push (.axiom, head)
   let commandAttributes? := commandAttributes? head

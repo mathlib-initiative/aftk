@@ -88,6 +88,13 @@ initialize Lean.registerBuiltinAttribute {
   add := fun _ _ _ => pure ()
 }
 
+syntax (name := otherAttr) "other_attribute " ident ident : attr
+initialize Lean.registerBuiltinAttribute {
+  name := `otherAttr
+  descr := "test attribute whose arguments resemble technical-debt markers"
+  add := fun _ _ _ => pure ()
+}
+
 macro "#adaptation_note" : command =>
   `(command| theorem adaptationNoteCommandMarker : True := True.intro)
 macro "#adaptation_note" : tactic => `(tactic| skip)
@@ -193,6 +200,26 @@ theorem erwMarker (a b : Nat) (h : a = b) : a = b := by
 macro "quoted_axiom" : command => `(command| axiom quoted : True)
 macro "quoted_deprecated" : command => `(command| @[deprecated] def quoted : Nat := 0)
 macro "quoted_sorry" : term => `(term| sorry)
+
+/-- A declaration whose name is an attribute argument below. -/
+def deprecated : Nat := 0
+
+@[inherit_doc deprecated]
+def current : Nat := deprecated
+
+@[other_attribute nolint simpNF]
+def unrelatedAttribute : Nat := 0
+
+public section expose
+def notExposed : Nat := 0
+end expose
+
+namespace Other
+def Fin.CommRing : Nat := 0
+def Fin.NatCast : Nat := 0
+end Other
+
+open Other (Fin.CommRing Fin.NatCast)
 EOF
 cat > "$PROJECT/ExtraDebt.lean" <<'EOF'
 module
