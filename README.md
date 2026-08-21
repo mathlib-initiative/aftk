@@ -17,6 +17,7 @@ lake exe aftk rdeps [options] <module> <declaration>
 lake exe aftk tech-debt [options] [module <module>|library <library>|package [<package>]]
 
 lake exe aftk diagnostics [options] <file>
+lake exe aftk probe [options] <module-or-file>
 lake exe aftk goals [options] <module> <line> <column>
 lake exe aftk open [options] <file>
 lake exe aftk restart <file>
@@ -62,7 +63,16 @@ lake exe aftk open --ttl-ms 600000 A/B/C.lean
 
 `goals` uses the same daemon/worker lifecycle and returns both Lean LSP plain tactic goals (`tacticGoals`) and plain term goals (`termGoal`) at a 1-based line/column in the given module.
 
-The daemon tracks each worker's import closure and local project source imports. If a tracked dependency changes on disk, the next `diagnostics` or `goals` call restarts the affected worker before elaborating. `open` is an optional warmup hint. `restart` reloads one file worker and its imports/dependencies. `close` releases one file worker. `--transient` / `--close-after` runs diagnostics/goals and releases the worker immediately.
+`probe` temporarily replaces an end-exclusive, 1-based source range in the worker's in-memory document, waits for Lean diagnostics, optionally queries goals, and restores the current file from disk before returning. Replacement text can be passed safely through standard input:
+
+```bash
+printf 'by\n  assumption' | lake exe aftk probe A.B.C \
+  --range 42:15-44:8 --stdin --goals-at 43:3
+```
+
+The JSON result contains `accepted`, candidate diagnostics, optional tactic/term goals, and `restored`. `accepted` means that Lean produced no error diagnostics; it is independent of the outer daemon-protocol `ok` field. Probes never write the replacement to disk, and requests for the same file are serialized so diagnostics and goal queries cannot observe a temporary candidate.
+
+The daemon tracks each worker's import closure and local project source imports. If a tracked dependency changes on disk, the next `diagnostics`, `probe`, or `goals` call restarts the affected worker before elaborating. `open` is an optional warmup hint. `restart` reloads one file worker and its imports/dependencies. `close` releases one file worker. `--transient` / `--close-after` runs diagnostics/probe/goals and releases the worker immediately.
 
 Resource management is built in for multi-agent use:
 
