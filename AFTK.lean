@@ -4,3 +4,4 @@ module
 -- Import modules here that should be built as part of the library.
 public import AFTK.Dependency
 public import AFTK.Server
+public import AFTK.TechDebt
