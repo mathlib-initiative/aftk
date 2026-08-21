@@ -2,6 +2,11 @@ module
 
 public import Lean.Elab.Frontend
 public import AFTK.Server
+public import Lake.Build.Infos
+public import Lake.Build.Job.Monad
+public import Lake.Build.Library
+public import Lake.Build.Run
+public import Lake.Load.Workspace
 
 public section
 
@@ -41,21 +46,39 @@ structure Finding where
   stop : Position
   deriving Inhabited
 
+/-- The configured scope of a technical-debt scan. -/
+inductive Scope where
+  /-- Scan one Lean module. -/
+  | module (moduleName : Name)
+  /-- Scan every module in one configured Lake library. -/
+  | library (libraryName : Name)
+  /-- Scan every Lean target in a Lake package; `none` selects the root package. -/
+  | package (packageName? : Option Name)
+  deriving Inhabited
+
 /-- Parsed `tech-debt` command arguments. -/
 structure Config where
-  moduleString : String
+  scope : Scope
   jsonl : Bool := false
   deriving Inhabited
 
 /-- Help text for the `tech-debt` command. -/
 def cliHelp : String :=
-"Find technical debt in a Lean module using elaborator info trees.
+"Find technical debt in Lean modules, libraries, and packages using elaborator info trees.
 
 Usage:
+  lake exe aftk tech-debt [options]
+  lake exe aftk tech-debt [options] module <module>
+  lake exe aftk tech-debt [options] library <library>
+  lake exe aftk tech-debt [options] package [<package>]
   lake exe aftk tech-debt [options] <module>
 
-Arguments:
-  <module>      Lean module to elaborate and inspect, e.g. Mathlib.Data.Nat.Basic.
+Scopes:
+  (no scope)                Scan the root Lake package.
+  module <module>           Scan one Lean module.
+  library <library>         Scan modules enumerated by the Lake library's `modules` facet.
+  package [<package>]       Scan all configured Lean libraries and executables in a package.
+  <module>                  Compatibility shorthand for `module <module>`.
 
 Options:
   --jsonl       Print one JSON object per finding instead of tab-separated rows.
@@ -69,24 +92,89 @@ Output:
   By default: <file>:<line>:<column>\t<kind>\t<description>.
   Positions are 1-based."
 
+/-- Interpret positional arguments as a scan scope. -/
+def parseScope (positionals : Array String) : Except String Scope := do
+  match positionals.toList with
+  | [] => return .package none
+  | ["package"] => return .package none
+  | ["package", packageName] => return .package (some packageName.toName)
+  | ["module", moduleName] => return .module moduleName.toName
+  | ["library", libraryName] => return .library libraryName.toName
+  | [moduleName] => return .module moduleName.toName
+  | "module" :: _ => throw "module scope expects exactly <module>"
+  | "library" :: _ => throw "library scope expects exactly <library>"
+  | "package" :: _ => throw "package scope accepts at most one <package>"
+  | _ => throw "expected module <module>, library <library>, or package [<package>]"
+
 /-- Parse `tech-debt` command arguments. `none` means help was requested. -/
 def parseArgs (args : List String) : Except String (Option Config) := do
-  let rec go (args : List String) (jsonl : Bool) (module? : Option String) : Except String (Option Config) := do
+  let rec go (args : List String) (jsonl : Bool) (positionals : Array String) : Except String (Option Config) := do
     match args with
-    | [] =>
-        match module? with
-        | some moduleString => return some { moduleString, jsonl }
-        | none => throw "missing argument: expected <module>"
+    | [] => return some { scope := ← parseScope positionals, jsonl }
     | "--help" :: _ | "-h" :: _ => return none
-    | "--jsonl" :: rest => go rest true module?
+    | "--jsonl" :: rest => go rest true positionals
     | arg :: rest =>
         if arg.startsWith "-" then
           throw s!"unknown option `{arg}`"
-        else if module?.isSome then
-          throw s!"too many positional arguments: unexpected `{arg}`"
         else
-          go rest jsonl (some arg)
-  go args false none
+          go rest jsonl (positionals.push arg)
+  go args false #[]
+
+/-- Load the Lake workspace rooted at the current project. -/
+def loadProjectWorkspace : IO Lake.Workspace := do
+  let root ← Server.findProjectRoot
+  let (elan?, lean?, lake?) ← Lake.findInstall?
+  let some lean := lean?
+    | throw <| IO.userError "could not locate the Lean installation"
+  let lake := lake?.getD (Lake.LakeInstall.ofLean lean)
+  let lakeEnv ← EIO.toIO (.userError ·) <| Lake.Env.compute lake lean elan?
+  let workspace? ← (Lake.loadWorkspace {
+    lakeEnv
+    wsDir := root
+    updateToolchain := false
+  }).toBaseIO { outLv := .warning }
+  let some workspace := workspace?
+    | throw <| IO.userError s!"failed to load Lake workspace at `{root}`"
+  return workspace
+
+/-- Fetch the modules belonging to configured Lake libraries through their `modules` facets. -/
+def libraryModules (workspace : Lake.Workspace) (libraries : Array Lake.LeanLib) : IO (Array Name) :=
+  workspace.runFetchM (cfg := { verbosity := .quiet }) do
+    let mut moduleNames := #[]
+    for library in libraries do
+      let modules ← (← library.modules.fetch).await
+      moduleNames := moduleNames ++ modules.map (·.name)
+    return moduleNames
+
+/-- Deduplicate and sort module names for deterministic package scans. -/
+def normalizeModuleNames (moduleNames : Array Name) : Array Name := Id.run do
+  let mut seen : NameHashSet := {}
+  let mut result := #[]
+  for moduleName in moduleNames do
+    unless seen.contains moduleName do
+      seen := seen.insert moduleName
+      result := result.push moduleName
+  return result.qsort fun a b => toString a < toString b
+
+/-- Resolve a CLI scan scope to the modules configured in the current Lake workspace. -/
+def modulesForScope (workspace : Lake.Workspace) (scope : Scope) : IO (Array Name) := do
+  match scope with
+  | .module moduleName =>
+      return #[moduleName]
+  | .library libraryName =>
+      let some library := workspace.findLeanLib? libraryName
+        | throw <| IO.userError s!"could not find Lean library `{libraryName}` in the Lake workspace"
+      return normalizeModuleNames (← libraryModules workspace #[library])
+  | .package packageName? =>
+      let package ← match packageName? with
+        | none => pure workspace.root
+        | some packageName =>
+            let some package := workspace.findPackageByName? packageName
+              | throw <| IO.userError s!"could not find package `{packageName}` in the Lake workspace"
+            pure package
+      let libraryModuleNames ← libraryModules workspace package.leanLibs
+      let executableModuleNames := package.leanExes.map (·.root.name)
+      return normalizeModuleNames (libraryModuleNames ++ executableModuleNames)
 
 /-- Resolve a module's Lean source file using the current Lake project's source search path. -/
 def resolveModuleSource (moduleName : Name) : IO System.FilePath := do
@@ -128,6 +216,7 @@ def moduleInfoTrees (moduleName : Name) (path : System.FilePath) : IO (FileMap �
   let inputCtx := Parser.mkInputContext input path.toString
   let (header, parserState, parseMessages) ← Parser.parseHeader inputCtx
   ensureNoErrors moduleName parseMessages
+  unsafe Lean.enableInitializersExecution
   let (env, headerMessages) ← Elab.processHeader header Options.empty parseMessages inputCtx
     (leakEnv := true) (mainModule := moduleName)
   ensureNoErrors moduleName headerMessages
@@ -198,7 +287,7 @@ partial def collectTree (moduleName : Name) (file : String) (fileMap : FileMap)
 
 /-- True when two findings describe the same source occurrence. -/
 def Finding.sameOccurrence (a b : Finding) : Bool :=
-  a.kind == b.kind && a.start == b.start && a.stop == b.stop
+  a.moduleName == b.moduleName && a.kind == b.kind && a.start == b.start && a.stop == b.stop
 
 /-- Remove duplicate nodes introduced by nested tactic/command info while preserving source order. -/
 def deduplicate (findings : Array Finding) : Array Finding := Id.run do
@@ -208,8 +297,8 @@ def deduplicate (findings : Array Finding) : Array Finding := Id.run do
       out := out.push finding
   return out
 
-/-- Sort findings by source position and then category for stable output. -/
-def lessForOutput (a b : Finding) : Bool :=
+/-- Sort findings within a module by source position and then category. -/
+def lessWithinModule (a b : Finding) : Bool :=
   if a.start.line != b.start.line then
     a.start.line < b.start.line
   else if a.start.column != b.start.column then
@@ -217,15 +306,33 @@ def lessForOutput (a b : Finding) : Bool :=
   else
     a.kind.name < b.kind.name
 
-/-- Find all recognized technical debt in a module. -/
-def find (moduleName : Name) : IO (Array Finding) := do
-  addProjectLeanSearchPath
+/-- Find all recognized technical debt in one module. -/
+def findModule (moduleName : Name) : IO (Array Finding) := do
   let path ← resolveModuleSource moduleName
   let (fileMap, trees) ← moduleInfoTrees moduleName path
   let mut findings := #[]
   for tree in trees do
     findings := collectTree moduleName path.toString fileMap tree findings
-  return (deduplicate findings).qsort lessForOutput
+  return (deduplicate findings).qsort lessWithinModule
+
+/-- Sort findings by module and source position for deterministic multi-module output. -/
+def lessForOutput (a b : Finding) : Bool :=
+  if a.moduleName != b.moduleName then
+    toString a.moduleName < toString b.moduleName
+  else
+    lessWithinModule a b
+
+/-- Find all recognized technical debt in a collection of modules. -/
+def findModules (moduleNames : Array Name) : IO (Array Finding) := do
+  addProjectLeanSearchPath
+  let mut findings := #[]
+  for moduleName in normalizeModuleNames moduleNames do
+    findings := findings ++ (← findModule moduleName)
+  return findings.qsort lessForOutput
+
+/-- Find all recognized technical debt in a module. -/
+def find (moduleName : Name) : IO (Array Finding) :=
+  findModules #[moduleName]
 
 /-- Render a finding as a tab-separated row. -/
 def formatFinding (finding : Finding) : String :=
@@ -244,7 +351,9 @@ def formatFindingJsonLine (finding : Finding) : String :=
 
 /-- Run the `tech-debt` command. -/
 def run (config : Config) : IO Unit := do
-  let findings ← find config.moduleString.toName
+  let workspace ← loadProjectWorkspace
+  let moduleNames ← modulesForScope workspace config.scope
+  let findings ← findModules moduleNames
   for finding in findings do
     if config.jsonl then
       IO.println (formatFindingJsonLine finding)

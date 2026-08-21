@@ -189,7 +189,7 @@ def topLevelHelp : String :=
 Usage:
   lake exe aftk deps [options] <module> <declaration>
   lake exe aftk rdeps [options] <module> <declaration>
-  lake exe aftk tech-debt [options] <module>
+  lake exe aftk tech-debt [options] [module <module>|library <library>|package [<package>]]
   lake exe aftk diagnostics [options] <file>
   lake exe aftk goals [options] <module> <line> <column>
   lake exe aftk open [options] <file>
@@ -206,7 +206,7 @@ Usage:
 Commands:
   deps          Display declarations that are transitive dependencies of a declaration.
   rdeps         Display declarations that transitively depend on a declaration.
-  tech-debt     Find technical debt in a Lean module using elaborator info trees.
+  tech-debt     Find technical debt in Lean modules, libraries, and packages.
   open          Warm up/open a Lean file worker in the project daemon.
   diagnostics   Elaborate a Lean file and print diagnostics as JSON.
   goals        Return term/tactic goals at a 1-based module location.

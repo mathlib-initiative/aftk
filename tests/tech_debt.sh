@@ -19,15 +19,28 @@ fi
 cat > "$PROJECT/lakefile.toml" <<'EOF'
 name = "tech_debt_test"
 version = "0.1.0"
-defaultTargets = ["TechDebtTest"]
+defaultTargets = ["TechDebtTest", "ExtraDebt", "debt_runner"]
 
 [[lean_lib]]
 name = "TechDebtTest"
+
+[[lean_lib]]
+name = "ExtraDebt"
+
+[[lean_exe]]
+name = "debt_runner"
+root = "DebtRunner"
 EOF
 cp "$ROOT/lean-toolchain" "$PROJECT/lean-toolchain"
-mkdir -p "$PROJECT/TechDebtTest"
+mkdir -p "$PROJECT/TechDebtTest" "$PROJECT/ExtraDebt"
+cat > "$PROJECT/TechDebtTest.lean" <<'EOF'
+module
+import TechDebtTest.Example
+EOF
 cat > "$PROJECT/TechDebtTest/Dependency.lean" <<'EOF'
 module
+
+set_option maxHeartbeats 200000
 
 def dependencyValue : Nat := 1
 EOF
@@ -55,10 +68,33 @@ theorem scopedHeartbeat : True := by
 
 -- Comments mentioning `erw` or `set_option maxHeartbeats` are not findings.
 EOF
-(cd "$PROJECT" && lake build TechDebtTest.Dependency)
+cat > "$PROJECT/ExtraDebt.lean" <<'EOF'
+module
+import ExtraDebt.Finding
+EOF
+cat > "$PROJECT/ExtraDebt/Finding.lean" <<'EOF'
+module
 
-printf 'test: tech-debt finds semantic command and tactic occurrences\n'
-(cd "$PROJECT" && "$AFTK_BIN" tech-debt --jsonl TechDebtTest.Example > findings.jsonl)
+theorem extraUsesErw (a b : Nat) (h : a = b) : a = b := by
+  erw [h]
+EOF
+cat > "$PROJECT/DebtRunner.lean" <<'EOF'
+module
+
+set_option maxHeartbeats 300000
+
+public def main : IO Unit := pure ()
+EOF
+cat > "$PROJECT/Orphan.lean" <<'EOF'
+module
+
+-- This file is deliberately outside every configured target.
+set_option maxHeartbeats 400000
+EOF
+(cd "$PROJECT" && lake build)
+
+printf 'test: tech-debt scans one module\n'
+(cd "$PROJECT" && "$AFTK_BIN" tech-debt --jsonl module TechDebtTest.Example > findings.jsonl)
 python3 - "$PROJECT/findings.jsonl" "$PROJECT/TechDebtTest/Example.lean" <<'PY'
 import json
 import sys
@@ -80,7 +116,48 @@ assert all(finding["module"] == "TechDebtTest.Example" for finding in findings)
 assert all(finding["file"] == expected_file for finding in findings)
 PY
 
-printf 'test: tech-debt default output and help\n'
+printf 'test: tech-debt scans one library through its modules facet\n'
+(cd "$PROJECT" && "$AFTK_BIN" tech-debt --jsonl library TechDebtTest > library.jsonl)
+python3 - "$PROJECT/library.jsonl" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    findings = [json.loads(line) for line in stream if line.strip()]
+
+assert [(finding["module"], finding["kind"]) for finding in findings] == [
+    ("TechDebtTest.Dependency", "maxHeartbeats"),
+    ("TechDebtTest.Example", "maxHeartbeats"),
+    ("TechDebtTest.Example", "erw"),
+    ("TechDebtTest.Example", "maxHeartbeats"),
+], findings
+PY
+
+printf 'test: tech-debt scans every configured target in the root package\n'
+(cd "$PROJECT" && "$AFTK_BIN" tech-debt --jsonl > package.jsonl)
+python3 - "$PROJECT/package.jsonl" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    findings = [json.loads(line) for line in stream if line.strip()]
+
+assert [(finding["module"], finding["kind"]) for finding in findings] == [
+    ("DebtRunner", "maxHeartbeats"),
+    ("ExtraDebt.Finding", "erw"),
+    ("TechDebtTest.Dependency", "maxHeartbeats"),
+    ("TechDebtTest.Example", "maxHeartbeats"),
+    ("TechDebtTest.Example", "erw"),
+    ("TechDebtTest.Example", "maxHeartbeats"),
+], findings
+assert all(finding["module"] != "Orphan" for finding in findings)
+PY
+
+printf 'test: tech-debt scans a named package\n'
+(cd "$PROJECT" && "$AFTK_BIN" tech-debt --jsonl package tech_debt_test > named-package.jsonl)
+cmp "$PROJECT/package.jsonl" "$PROJECT/named-package.jsonl"
+
+printf 'test: tech-debt compatibility syntax, default output, and help\n'
 (cd "$PROJECT" && "$AFTK_BIN" tech-debt TechDebtTest.Example > findings.tsv)
 [[ "$(wc -l < "$PROJECT/findings.tsv")" -eq 3 ]]
 grep -q $'Example.lean:4:1\tmaxHeartbeats\t' "$PROJECT/findings.tsv"

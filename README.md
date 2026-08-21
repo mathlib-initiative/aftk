@@ -5,7 +5,7 @@ AFTK provides the `aftk` Lake executable for dependency analysis of Lean declara
 ```bash
 lake exe aftk deps [options] <module> <declaration>
 lake exe aftk rdeps [options] <module> <declaration>
-lake exe aftk tech-debt [options] <module>
+lake exe aftk tech-debt [options] [module <module>|library <library>|package [<package>]]
 
 lake exe aftk diagnostics [options] <file>
 lake exe aftk goals [options] <module> <line> <column>
@@ -76,14 +76,22 @@ For large imports such as Mathlib, prefer using module filters with `rdeps`.
 
 ## Technical-debt detection
 
-`tech-debt` elaborates a Lean module, traverses its info trees, and reports recognized technical
+`tech-debt` elaborates Lean modules, traverses their info trees, and reports recognized technical
 debt with 1-based source locations. It currently detects commands that set `maxHeartbeats` and
-uses of Core Lean's `erw` tactic.
+uses of Core Lean's `erw` tactic. Scans can target one module, one configured Lean library, or all
+Lean targets in a package:
 
 ```bash
-lake exe aftk tech-debt A.B.C
-lake exe aftk tech-debt A.B.C --jsonl
+lake exe aftk tech-debt module A.B.C
+lake exe aftk tech-debt library MyLibrary
+lake exe aftk tech-debt package my_package
+lake exe aftk tech-debt                 # root package
+lake exe aftk tech-debt A.B.C --jsonl  # module compatibility shorthand
 ```
+
+Library scans use Lake's `modules` facet, so they follow the library's configured roots and local
+imports. Package scans combine those facet results for every Lean library in the package and add
+the root module of each configured Lean executable.
 
 The default output is tab-separated:
 
