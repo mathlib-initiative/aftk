@@ -1335,12 +1335,21 @@ def validateProbeRange (fileMap : FileMap) (range : Lsp.Range) : Except String U
     throw "probe range end precedes its start"
 
 /-- Restore an open worker to the latest text on disk after a temporary probe. -/
-def Manager.restoreAfterProbe (m : Manager) (path : FilePath) (timeoutMs : Nat) : IO Unit := do
+def Manager.restoreAfterProbe (m : Manager) (path : FilePath) (baseline : String)
+    (baselineStamp? : Option ImportStamp) (timeoutMs : Nat) : IO Unit := do
   let some ofile ← m.getOpen? path
     | return
+  let text := (← IO.FS.readFile path).crlfToLf
+  let diskChanged := text != baseline || (← importStamp? path) != baselineStamp?
   let ofile ← match ← ofile.worker.statusRef.get with
-    | .running => m.syncFileFromDisk ofile
-    | .terminated _ | .crashed _ => m.restartFileFromDisk ofile
+    | .running =>
+        -- Do not use `syncFileFromDisk` here: candidate text differing from disk is not a disk edit.
+        if (← ofile.lastTextRef.get) != text then
+          discard <| ofile.sendFullTextChange text
+        pure ofile
+    | .terminated _ | .crashed _ => m.restartFile ofile text
+  if diskChanged then
+    m.markDependentsStale path
   discard <| ofile.waitForDiagnosticsVersion timeoutMs
   ofile.updateImportSnapshot m.projectRoot
 
@@ -1354,6 +1363,7 @@ def Manager.probeCore (m : Manager) (target : String) (replacementRange : Lsp.Ra
   let ofile ← m.syncFileFromDisk ofile
   let (ofile, _) ← m.maybeRestartForDiagnostics ofile refresh
   let baseline ← ofile.lastTextRef.get
+  let baselineStamp? ← importStamp? path
   let baselineMap := baseline.toFileMap
   exceptToIO <| validateProbeRange baselineMap replacementRange
   let candidate := (Lean.Server.replaceLspRange baselineMap replacementRange replacement).source
@@ -1396,7 +1406,7 @@ def Manager.probeCore (m : Manager) (target : String) (replacementRange : Lsp.Ra
               ("goalError", e.toString)]
         return Json.mkObj fields
   finally
-    m.restoreAfterProbe path timeoutMs
+    m.restoreAfterProbe path baseline baselineStamp? timeoutMs
 
 /-- Run a serialized probe transaction and optionally release its worker afterwards. -/
 def Manager.probe (m : Manager) (target : String) (replacementRange : Lsp.Range)
@@ -2074,8 +2084,10 @@ partial def runProbeCli (args : List String) : IO UInt32 := do
         fields := fields ++ [("goalLine", toJson line), ("goalColumn", toJson column)]
       if let some ttlMs := config.ttlMs? then
         fields := fields ++ [("ttlMs", toJson ttlMs)]
+      -- Candidate diagnostics and restoration each get one timeout; goal endpoints can use two more.
+      let phaseCount := if config.goalsAt?.isSome then 4 else 2
       printDaemonResponse (← sendToDaemon md "probe" (Json.mkObj fields)
-        (config.timeoutMs * 2 + 5000))
+        (config.timeoutMs * phaseCount + 5000))
 
 /-- Run the diagnostics CLI command. -/
 partial def runDiagnosticsCli (args : List String) : IO UInt32 := do
