@@ -4,7 +4,6 @@ set -Eeuo pipefail
 # End-to-end tests for semantic technical-debt detection.
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-AFTK_BIN=${AFTK_BIN:-"$ROOT/.lake/build/bin/aftk"}
 PROJECT=$(mktemp -d /tmp/aftk-tech-debt-test-XXXXXX)
 
 cleanup() {
@@ -12,14 +11,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ ! -x "$AFTK_BIN" ]]; then
-  (cd "$ROOT" && lake build aftk)
-fi
-
 cat > "$PROJECT/lakefile.toml" <<'EOF'
 name = "tech_debt_test"
 version = "0.1.0"
 defaultTargets = ["TechDebtTest", "ExtraDebt", "debt_runner"]
+
+[[require]]
+name = "aftk"
+path = "aftk-dependency"
 
 [[lean_lib]]
 name = "TechDebtTest"
@@ -31,11 +30,13 @@ name = "ExtraDebt"
 name = "debt_runner"
 root = "DebtRunner"
 EOF
+ln -s "$ROOT" "$PROJECT/aftk-dependency"
 cp "$ROOT/lean-toolchain" "$PROJECT/lean-toolchain"
 mkdir -p "$PROJECT/TechDebtTest" "$PROJECT/ExtraDebt"
 cat > "$PROJECT/TechDebtTest.lean" <<'EOF'
 module
 import TechDebtTest.Example
+import TechDebtTest.Markers
 EOF
 cat > "$PROJECT/TechDebtTest/Dependency.lean" <<'EOF'
 module
@@ -68,6 +69,131 @@ theorem scopedHeartbeat : True := by
 
 -- Comments mentioning `erw` or `set_option maxHeartbeats` are not findings.
 EOF
+cat > "$PROJECT/TechDebtTest/MarkerSupport.lean" <<'EOF'
+module
+public import Lean
+
+public register_option backward.example : Bool := { defValue := true, descr := "test option" }
+public register_option linter.flexible : Bool := { defValue := true, descr := "test option" }
+public register_option linter.overlappingInstances : Bool := { defValue := true, descr := "test option" }
+public register_option linter.auxLemma : Bool := { defValue := true, descr := "test option" }
+public register_option linter.style.longFile : Nat := { defValue := 1000, descr := "test option" }
+
+public section
+
+syntax (name := nolintAttr) "nolint " ident : attr
+initialize Lean.registerBuiltinAttribute {
+  name := `nolintAttr
+  descr := "test attribute"
+  add := fun _ _ _ => pure ()
+}
+
+macro "#adaptation_note" : command =>
+  `(command| theorem adaptationNoteCommandMarker : True := True.intro)
+macro "#adaptation_note" : tactic => `(tactic| skip)
+macro "#adaptation_note " value:term : term => `($value)
+
+namespace Fin.CommRing
+public def marker : Nat := 1
+end Fin.CommRing
+
+namespace Fin.NatCast
+public def marker : Nat := 1
+end Fin.NatCast
+
+end
+EOF
+cat > "$PROJECT/TechDebtTest/Markers.lean" <<'EOF'
+module
+import TechDebtTest.MarkerSupport
+meta import TechDebtTest.MarkerSupport
+
+set_option maxHeartbeats 1000 in
+def heartbeatMarker : Nat := 1
+
+set_option synthInstance.maxHeartbeats 1000 in
+def synthHeartbeatMarker : Nat := 1
+
+def recursionDepthMarker : Nat := set_option maxRecDepth 100 in 1
+
+def backwardMarker : Nat := set_option backward.example false in 1
+
+theorem flexibleMarker : True := by
+  set_option linter.flexible false in
+    trivial
+
+set_option linter.overlappingInstances false in
+def overlappingInstancesMarker : Nat := 1
+
+set_option linter.auxLemma false in
+def auxiliaryLemmaMarker : Nat := 1
+
+set_option linter.deprecated false in
+def deprecationLinterMarker : Nat := 1
+
+set_option warning.simp.varHead false in
+def simpVarHeadMarker : Nat := 1
+
+set_option pp.universes true in
+def developmentOptionMarker : Nat := 1
+
+set_option linter.style.longFile 2000
+
+section
+unlock_limits
+def unlockedMarker : Nat := 1
+end
+
+theorem simpInstancesMarker : True := by
+  simp +instances
+
+theorem dsimpInstancesMarker : True := by
+  dsimp +instances
+
+#adaptation_note
+
+theorem tacticAdaptationMarker : True := by
+  #adaptation_note
+  trivial
+
+def termAdaptationMarker : Nat := #adaptation_note 1
+
+@[nolint simpNF]
+def simpNFMarker : Nat := 1
+
+def simpNFAttributeMarker : Nat := 1
+attribute [nolint simpNF] simpNFAttributeMarker
+
+@[expose] public section
+def exposedMarker : Nat := 1
+end
+
+open Fin.CommRing in
+def finCommRingMarker : Nat := marker
+
+open Fin.NatCast in
+def finNatCastMarker : Nat := marker
+
+def sorryTermMarker : Nat := sorry
+
+theorem admitTacticMarker : True := by
+  admit
+
+def replacement : Nat := 1
+
+@[deprecated replacement (since := "2026-01-01")]
+def oldReplacement : Nat := replacement
+
+axiom axiomMarker : True
+
+theorem erwMarker (a b : Nat) (h : a = b) : a = b := by
+  erw [h]
+
+-- Marker syntax inside quotations is data, not technical debt in this module.
+macro "quoted_axiom" : command => `(command| axiom quoted : True)
+macro "quoted_deprecated" : command => `(command| @[deprecated] def quoted : Nat := 0)
+macro "quoted_sorry" : term => `(term| sorry)
+EOF
 cat > "$PROJECT/ExtraDebt.lean" <<'EOF'
 module
 import ExtraDebt.Finding
@@ -93,8 +219,81 @@ set_option maxHeartbeats 400000
 EOF
 (cd "$PROJECT" && lake build)
 
+printf 'test: tech-debt finds every supported marker\n'
+(cd "$PROJECT" && lake exe aftk tech-debt --jsonl --all-markers \
+  module TechDebtTest.Markers > all-markers.jsonl)
+python3 - "$PROJECT/all-markers.jsonl" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    findings = [json.loads(line) for line in stream if line.strip()]
+
+assert [(finding["range"]["start"]["line"], finding["kind"]) for finding in findings] == [
+    (5, "maxHeartbeats"),
+    (8, "maxHeartbeats"),
+    (11, "maxRecDepth"),
+    (13, "backwardOption"),
+    (16, "linterFlexible"),
+    (19, "linterOverlappingInstances"),
+    (22, "linterAuxLemma"),
+    (25, "linterDeprecated"),
+    (28, "simpVarHead"),
+    (31, "developmentOption"),
+    (34, "longFile"),
+    (37, "unlockLimits"),
+    (42, "simpInstances"),
+    (45, "dsimpInstances"),
+    (47, "adaptationNote"),
+    (50, "adaptationNote"),
+    (53, "adaptationNote"),
+    (55, "simpNF"),
+    (59, "simpNF"),
+    (61, "exposePublic"),
+    (65, "finCommRing"),
+    (68, "finNatCast"),
+    (71, "sorry"),
+    (74, "sorry"),
+    (78, "deprecated"),
+    (81, "axiom"),
+    (84, "erw"),
+], findings
+PY
+
+printf 'test: tech-debt requires an explicit, valid marker selection\n'
+if (cd "$PROJECT" && lake exe aftk tech-debt module TechDebtTest.Markers \
+    > missing-markers.out 2> missing-markers.err); then
+  echo 'tech-debt unexpectedly accepted a missing marker selection' >&2
+  exit 1
+fi
+grep -q 'missing marker selection' "$PROJECT/missing-markers.err"
+if (cd "$PROJECT" && lake exe aftk tech-debt --markers notAMarker \
+    module TechDebtTest.Markers > unknown-marker.out 2> unknown-marker.err); then
+  echo 'tech-debt unexpectedly accepted an unknown marker' >&2
+  exit 1
+fi
+grep -q 'unknown technical-debt marker' "$PROJECT/unknown-marker.err"
+
+printf 'test: tech-debt filters and deduplicates explicit marker selections\n'
+(cd "$PROJECT" && lake exe aftk tech-debt --jsonl --markers sorry \
+  --markers=erw,sorry module TechDebtTest.Markers > selected-markers.jsonl)
+python3 - "$PROJECT/selected-markers.jsonl" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    findings = [json.loads(line) for line in stream if line.strip()]
+
+assert [(finding["range"]["start"]["line"], finding["kind"]) for finding in findings] == [
+    (71, "sorry"),
+    (74, "sorry"),
+    (84, "erw"),
+], findings
+PY
+
 printf 'test: tech-debt scans one module\n'
-(cd "$PROJECT" && "$AFTK_BIN" tech-debt --jsonl module TechDebtTest.Example > findings.jsonl)
+(cd "$PROJECT" && lake exe aftk tech-debt --jsonl --markers maxHeartbeats,erw \
+  module TechDebtTest.Example > findings.jsonl)
 python3 - "$PROJECT/findings.jsonl" "$PROJECT/TechDebtTest/Example.lean" <<'PY'
 import json
 import sys
@@ -117,7 +316,8 @@ assert all(finding["file"] == expected_file for finding in findings)
 PY
 
 printf 'test: tech-debt scans one library through its modules facet\n'
-(cd "$PROJECT" && "$AFTK_BIN" tech-debt --jsonl library TechDebtTest > library.jsonl)
+(cd "$PROJECT" && lake exe aftk tech-debt --jsonl --markers maxHeartbeats,erw \
+  library TechDebtTest > library.jsonl)
 python3 - "$PROJECT/library.jsonl" <<'PY'
 import json
 import sys
@@ -130,11 +330,14 @@ assert [(finding["module"], finding["kind"]) for finding in findings] == [
     ("TechDebtTest.Example", "maxHeartbeats"),
     ("TechDebtTest.Example", "erw"),
     ("TechDebtTest.Example", "maxHeartbeats"),
+    ("TechDebtTest.Markers", "maxHeartbeats"),
+    ("TechDebtTest.Markers", "maxHeartbeats"),
+    ("TechDebtTest.Markers", "erw"),
 ], findings
 PY
 
 printf 'test: tech-debt scans every configured target in the root package\n'
-(cd "$PROJECT" && "$AFTK_BIN" tech-debt --jsonl > package.jsonl)
+(cd "$PROJECT" && lake exe aftk tech-debt --jsonl --markers maxHeartbeats,erw > package.jsonl)
 python3 - "$PROJECT/package.jsonl" <<'PY'
 import json
 import sys
@@ -149,19 +352,24 @@ assert [(finding["module"], finding["kind"]) for finding in findings] == [
     ("TechDebtTest.Example", "maxHeartbeats"),
     ("TechDebtTest.Example", "erw"),
     ("TechDebtTest.Example", "maxHeartbeats"),
+    ("TechDebtTest.Markers", "maxHeartbeats"),
+    ("TechDebtTest.Markers", "maxHeartbeats"),
+    ("TechDebtTest.Markers", "erw"),
 ], findings
 assert all(finding["module"] != "Orphan" for finding in findings)
 PY
 
 printf 'test: tech-debt scans a named package\n'
-(cd "$PROJECT" && "$AFTK_BIN" tech-debt --jsonl package tech_debt_test > named-package.jsonl)
+(cd "$PROJECT" && lake exe aftk tech-debt --jsonl --markers maxHeartbeats,erw \
+  package tech_debt_test > named-package.jsonl)
 cmp "$PROJECT/package.jsonl" "$PROJECT/named-package.jsonl"
 
 printf 'test: tech-debt compatibility syntax, default output, and help\n'
-(cd "$PROJECT" && "$AFTK_BIN" tech-debt TechDebtTest.Example > findings.tsv)
+(cd "$PROJECT" && lake exe aftk tech-debt --markers maxHeartbeats,erw \
+  TechDebtTest.Example > findings.tsv)
 [[ "$(wc -l < "$PROJECT/findings.tsv")" -eq 3 ]]
 grep -q $'Example.lean:4:1\tmaxHeartbeats\t' "$PROJECT/findings.tsv"
 grep -q $'Example.lean:8:3\terw\t' "$PROJECT/findings.tsv"
-"$AFTK_BIN" help tech-debt | grep -q 'Find technical debt'
+(cd "$PROJECT" && lake exe aftk help tech-debt) | grep -q 'Find technical debt'
 
 printf 'all tech-debt tests passed\n'

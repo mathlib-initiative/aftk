@@ -1,6 +1,15 @@
 # aftk
 
-AFTK provides the `aftk` Lake executable for dependency analysis of Lean declarations and fast, daemon-backed diagnostics for Lean files.
+AFTK provides the `aftk` Lake executable for dependency analysis of Lean declarations, technical-debt detection, and fast daemon-backed diagnostics for Lean files. Add AFTK as a dependency of the Lean project you want to inspect:
+
+```toml
+[[require]]
+name = "aftk"
+git = "https://github.com/mathlib-initiative/aftk"
+rev = "main"
+```
+
+Then run AFTK through that project's Lake environment. This gives AFTK the project's source paths, compiled modules, dependencies, and Lake configuration:
 
 ```bash
 lake exe aftk deps [options] <module> <declaration>
@@ -76,18 +85,17 @@ For large imports such as Mathlib, prefer using module filters with `rdeps`.
 
 ## Technical-debt detection
 
-`tech-debt` elaborates Lean modules, traverses their info trees, and reports recognized technical
-debt with 1-based source locations. It currently detects commands that set `maxHeartbeats` and
-uses of Core Lean's `erw` tactic. Scans can target one module, one configured Lean library, or all
-Lean targets in a package:
+`tech-debt` elaborates Lean modules, traverses their info trees, and reports configured technical-debt markers with 1-based source locations. Every invocation must select markers explicitly with `--markers` or `--all-markers`; there are no default or otherwise special markers.
 
 ```bash
-lake exe aftk tech-debt module A.B.C
-lake exe aftk tech-debt library MyLibrary
-lake exe aftk tech-debt package my_package
-lake exe aftk tech-debt                 # root package
-lake exe aftk tech-debt A.B.C --jsonl  # module compatibility shorthand
+lake exe aftk tech-debt --markers maxHeartbeats,erw module A.B.C
+lake exe aftk tech-debt --all-markers library MyLibrary
+lake exe aftk tech-debt --markers sorry,axiom package my_package
+lake exe aftk tech-debt --markers deprecated                 # root package
+lake exe aftk tech-debt --markers simpNF A.B.C --jsonl       # module shorthand
 ```
+
+`--markers` accepts a comma-separated list and may be repeated. Supported marker names are `maxHeartbeats`, `maxRecDepth`, `unlockLimits`, `backwardOption`, `linterFlexible`, `linterOverlappingInstances`, `linterAuxLemma`, `linterDeprecated`, `simpVarHead`, `developmentOption`, `longFile`, `erw`, `simpInstances`, `dsimpInstances`, `adaptationNote`, `simpNF`, `exposePublic`, `finCommRing`, `finNatCast`, `sorry`, `deprecated`, and `axiom`. Run `lake exe aftk help tech-debt` for their descriptions.
 
 Library scans use Lake's `modules` facet, so they follow the library's configured roots and local
 imports. Package scans combine those facet results for every Lean library in the package and add
