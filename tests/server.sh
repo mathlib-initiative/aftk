@@ -148,6 +148,94 @@ assert r["termGoal"]["range"]["start"] == {"line": 6, "column": 3}
 assert_json "$p/goals-status.json" 'assert data["ok"]; assert data["result"]["openFileCount"] == 0'
 (cd "$p" && "$AFTK_BIN" shutdown >/dev/null)
 
+printf 'test: probe elaborates temporary replacements and restores the file\n'
+"$AFTK_BIN" probe --help | grep -q -- '--goals-at <line:column>'
+p=$(make_project)
+cat > "$p/Tmp/Probe.lean" <<'EOF'
+module
+
+theorem probeTarget (p q : Prop) (hp : p) : q → p := by
+  intro hq
+  exact hp
+EOF
+cp "$p/Tmp/Probe.lean" "$p/probe-baseline.lean"
+(cd "$p" && printf 'assumption' | "$AFTK_BIN" probe Tmp.Probe \
+  --range 5:3-5:11 --stdin --timeout-ms 20000 > probe-good.json)
+(cd "$p" && printf 'exact hq' | "$AFTK_BIN" probe Tmp.Probe \
+  --range 5:3-5:11 --stdin --timeout-ms 20000 > probe-bad.json)
+(cd "$p" && printf 'exact ?_' | "$AFTK_BIN" probe Tmp.Probe \
+  --range 5:3-5:11 --stdin --goals-at 5:3 --timeout-ms 20000 > probe-goals.json)
+(cd "$p" && "$AFTK_BIN" probe Tmp.Probe --at 5:3 --text 'skip; ' \
+  --timeout-ms 20000 > probe-insert.json)
+(cd "$p" && "$AFTK_BIN" diagnostics Tmp/Probe.lean --timeout-ms 20000 > probe-restored.json)
+cmp "$p/probe-baseline.lean" "$p/Tmp/Probe.lean"
+assert_json "$p/probe-good.json" '
+assert data["ok"]
+r = data["result"]
+assert r["accepted"] is True
+assert r["diagnostics"] == []
+assert r["replacementRange"] == {
+    "start": {"line": 5, "column": 3},
+    "end": {"line": 5, "column": 11},
+}
+assert r["restored"] is True
+'
+assert_json "$p/probe-bad.json" '
+assert data["ok"]
+r = data["result"]
+assert r["accepted"] is False
+assert any(d["severity"] == "error" for d in r["diagnostics"])
+assert any("type mismatch" in d["message"].lower() for d in r["diagnostics"])
+assert r["restored"] is True
+'
+assert_json "$p/probe-goals.json" '
+assert data["ok"]
+r = data["result"]
+assert r["accepted"] is False
+assert r["goalsPosition"] == {"line": 5, "column": 3}
+assert r["tacticGoals"] is not None
+assert "hq : q" in r["tacticGoals"]["rendered"]
+assert "⊢ p" in r["tacticGoals"]["rendered"]
+assert r["restored"] is True
+'
+assert_json "$p/probe-restored.json" 'assert data["ok"]; assert data["result"]["diagnostics"] == []'
+assert_json "$p/probe-insert.json" 'assert data["ok"]; assert data["result"]["accepted"] is True'
+
+printf 'test: probe restores after header changes and serializes concurrent diagnostics\n'
+if (cd "$p" && printf 'import Missing' | "$AFTK_BIN" probe Tmp.Probe \
+    --range 1:1-1:7 --stdin --timeout-ms 20000 > probe-header.json); then
+  echo 'probe unexpectedly accepted a header-changing candidate' >&2
+  exit 1
+fi
+assert_json "$p/probe-header.json" 'assert data["ok"] is False'
+(cd "$p" && "$AFTK_BIN" diagnostics Tmp/Probe.lean --timeout-ms 20000 > probe-after-header.json)
+assert_json "$p/probe-after-header.json" 'assert data["ok"]; assert data["result"]["diagnostics"] == []'
+(
+  cd "$p"
+  printf 'run_tac IO.sleep 1000\n  exact hq' | "$AFTK_BIN" probe Tmp.Probe \
+    --range 5:3-5:11 --stdin --timeout-ms 20000 > probe-concurrent.json
+) &
+probe_pid=$!
+sleep 0.2
+(cd "$p" && "$AFTK_BIN" diagnostics Tmp/Probe.lean --timeout-ms 20000 > probe-concurrent-diagnostics.json)
+wait "$probe_pid"
+assert_json "$p/probe-concurrent.json" '
+assert data["ok"]
+assert data["result"]["accepted"] is False
+assert any(d["severity"] == "error" for d in data["result"]["diagnostics"])
+'
+assert_json "$p/probe-concurrent-diagnostics.json" '
+assert data["ok"]
+assert data["result"]["diagnostics"] == []
+'
+cmp "$p/probe-baseline.lean" "$p/Tmp/Probe.lean"
+(cd "$p" && printf 'assumption' | "$AFTK_BIN" probe Tmp.Probe \
+  --range 5:3-5:11 --stdin --transient --timeout-ms 20000 > probe-transient.json)
+(cd "$p" && "$AFTK_BIN" status > probe-status.json)
+assert_json "$p/probe-transient.json" 'assert data["ok"]; assert data["result"]["accepted"] is True'
+assert_json "$p/probe-status.json" 'assert data["ok"]; assert data["result"]["openFileCount"] == 0'
+(cd "$p" && "$AFTK_BIN" shutdown >/dev/null)
+
 printf 'test: goals resolves custom srcDir modules without inherited LEAN_SRC_PATH\n'
 p=$(mktemp -d /tmp/aftk-test-XXXXXX)
 temps+=("$p")

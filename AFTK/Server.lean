@@ -19,7 +19,7 @@ open System
 open Std.Net
 
 /-- Current AFTK daemon protocol version. -/
-def protocolVersion : Nat := 3
+def protocolVersion : Nat := 4
 
 /-- Metadata persisted by a daemon in `.lake/aftk/server.json`. -/
 structure ServerMeta where
@@ -417,6 +417,15 @@ def parseLineColumnString (raw : String) : Except String (Nat × Nat) := do
       return (line, column)
   | _ => throw s!"invalid location `{raw}`; expected <line>:<column>"
 
+/-- Parse a 1-based `<start-line>:<start-column>-<end-line>:<end-column>` range. -/
+def parseRangeString (raw : String) : Except String (Nat × Nat × Nat × Nat) := do
+  match raw.splitOn "-" with
+  | [start, stop] =>
+      let (startLine, startColumn) ← parseLineColumnString start
+      let (endLine, endColumn) ← parseLineColumnString stop
+      return (startLine, startColumn, endLine, endColumn)
+  | _ => throw s!"invalid range `{raw}`; expected <line>:<column>-<line>:<column>"
+
 /-- Convert an LSP range to a 1-based agent-facing JSON object. -/
 def rangeJson1 (r : Range) : Json :=
   Json.mkObj [("start", positionJson1 r.start), ("end", positionJson1 r.end)]
@@ -476,6 +485,7 @@ structure OpenFile where
   openedAtMs : Nat
   busyRef : IO.Ref Nat
   leaseExpiresMsRef : IO.Ref (Option Nat)
+  operationLock : Std.Mutex Unit
 
 /-- Daemon manager state. -/
 structure Manager where
@@ -886,6 +896,14 @@ def Manager.markDependentsStale (m : Manager) (changedPath : FilePath) : IO Unit
 def OpenFile.isBusy (ofile : OpenFile) : IO Bool := do
   return (← ofile.busyRef.get) > 0
 
+/-- Serialize a semantic operation on one file and protect its worker from resource eviction. -/
+def OpenFile.withOperation (ofile : OpenFile) (action : IO α) : IO α := do
+  ofile.busyRef.modify (· + 1)
+  try
+    ofile.operationLock.atomically action
+  finally
+    ofile.busyRef.modify fun n => if n == 0 then 0 else n - 1
+
 /-- Update optional lease metadata for an open file. -/
 def OpenFile.updateLease (ofile : OpenFile) (ttlMs? : Option Nat := none) : IO Unit := do
   if let some ttlMs := ttlMs? then
@@ -1045,6 +1063,7 @@ def Manager.openFile (m : Manager) (file : String) (buildMode : DependencyBuildM
     openedAtMs := now
     busyRef := ← IO.mkRef 0
     leaseExpiresMsRef := ← IO.mkRef leaseExpires?
+    operationLock := ← Std.Mutex.new ()
   }
   m.insertOpen ofile
   return Json.mkObj [("file", path.toString), ("uri", worker.uri), ("version", version), ("status", "open")]
@@ -1069,6 +1088,7 @@ def Manager.restartFile (m : Manager) (ofile : OpenFile) (text : String) : IO Op
     openedAtMs := ofile.openedAtMs
     busyRef := ofile.busyRef
     leaseExpiresMsRef := ofile.leaseExpiresMsRef
+    operationLock := ofile.operationLock
   }
   m.insertOpen ofile'
   return ofile'
@@ -1085,6 +1105,20 @@ def Manager.ensureOpen (m : Manager) (file : String) (ttlMs? : Option Nat := non
     | throw <| IO.userError "failed to open file"
   return ofile
 
+/-- Replace the worker's in-memory document with a full text change and return its new version. -/
+def OpenFile.sendFullTextChange (ofile : OpenFile) (text : String) : IO Nat := do
+  let text := text.crlfToLf
+  let version ← ofile.versionRef.modifyGet fun v => (v + 1, v + 1)
+  let params : DidChangeTextDocumentParams := {
+    textDocument := { uri := ofile.uri, version? := some version }
+    contentChanges := #[.fullChange text]
+  }
+  ofile.worker.latestDiagnosticsRef.set none
+  ofile.worker.writeMessage (.notification "textDocument/didChange" ((toStructured? params).toOption))
+  ofile.lastTextRef.set text
+  ofile.lastUsedMsRef.set (← IO.monoMsNow)
+  return version
+
 /-- Send full-document didChange if the file changed on disk. -/
 def Manager.syncFileFromDisk (m : Manager) (ofile : OpenFile) : IO OpenFile := do
   let text := (← IO.FS.readFile ofile.path).crlfToLf
@@ -1092,15 +1126,8 @@ def Manager.syncFileFromDisk (m : Manager) (ofile : OpenFile) : IO OpenFile := d
   if text == oldText then
     ofile.lastUsedMsRef.set (← IO.monoMsNow)
     return ofile
-  let version ← ofile.versionRef.modifyGet fun v => (v + 1, v + 1)
-  ofile.lastTextRef.set text
-  let params : DidChangeTextDocumentParams := {
-    textDocument := { uri := ofile.uri, version? := some version }
-    contentChanges := #[.fullChange text]
-  }
-  ofile.worker.writeMessage (.notification "textDocument/didChange" ((toStructured? params).toOption))
+  discard <| ofile.sendFullTextChange text
   Manager.markDependentsStale m ofile.path
-  ofile.lastUsedMsRef.set (← IO.monoMsNow)
   return ofile
 
 /-- Restart a file worker using the current file contents. -/
@@ -1124,6 +1151,29 @@ def OpenFile.waitForDiagnosticsVersion (ofile : OpenFile) (timeoutMs : Nat) : IO
   let promise ← ofile.worker.request "textDocument/waitForDiagnostics" (toJson waitParams)
   discard <| waitPromiseTimeout promise timeoutMs
   return version
+
+/-- Plain tactic and term goals returned for one document position. -/
+structure PlainGoalsResult where
+  tacticGoal? : Option PlainGoal
+  termGoal? : Option PlainTermGoal
+
+/-- Query both plain-goal endpoints for an open file. -/
+def OpenFile.queryPlainGoals (ofile : OpenFile) (pos : Lsp.Position)
+    (timeoutMs : Nat) : IO PlainGoalsResult := do
+  let posParams : TextDocumentPositionParams := {
+    textDocument := { uri := ofile.uri }
+    position := pos
+  }
+  let tacticParams : PlainGoalParams := { toTextDocumentPositionParams := posParams }
+  let termParams : PlainTermGoalParams := { toTextDocumentPositionParams := posParams }
+  let tacticPromise ← ofile.worker.request "$/lean/plainGoal" (toJson tacticParams)
+  let termPromise ← ofile.worker.request "$/lean/plainTermGoal" (toJson termParams)
+  let tacticJson ← waitPromiseTimeout tacticPromise timeoutMs
+  let termJson ← waitPromiseTimeout termPromise timeoutMs
+  return {
+    tacticGoal? := ← exceptToIO <| fromJson? tacticJson
+    termGoal? := ← exceptToIO <| fromJson? termJson
+  }
 
 /-- Diagnostics implementation; callers may wrap it with close-after cleanup. -/
 partial def Manager.diagnosticsCore (m : Manager) (file : String) (timeoutMs : Nat := 30000) (includeRaw : Bool := false)
@@ -1182,8 +1232,10 @@ partial def Manager.diagnosticsCore (m : Manager) (file : String) (timeoutMs : N
 /-- Request diagnostics for a file, auto-opening if needed. -/
 partial def Manager.diagnostics (m : Manager) (file : String) (timeoutMs : Nat := 30000) (includeRaw : Bool := false)
     (retry := true) (refresh := false) (closeAfter := false) (ttlMs? : Option Nat := none) : IO Json := do
+  let operationFile ← m.ensureOpen file ttlMs?
   try
-    Manager.diagnosticsCore m file timeoutMs includeRaw retry refresh ttlMs?
+    operationFile.withOperation <|
+      Manager.diagnosticsCore m file timeoutMs includeRaw retry refresh ttlMs?
   finally
     if closeAfter then
       try
@@ -1230,23 +1282,15 @@ partial def Manager.goalsCore (m : Manager) (moduleName : String) (pos : Lsp.Pos
                 throw e
           | _ => throw e
         ofile.updateImportSnapshot m.projectRoot
-        let posParams : TextDocumentPositionParams := { textDocument := { uri := ofile.uri }, position := pos }
-        let tacticParams : PlainGoalParams := { toTextDocumentPositionParams := posParams }
-        let termParams : PlainTermGoalParams := { toTextDocumentPositionParams := posParams }
-        let tacticPromise ← ofile.worker.request "$/lean/plainGoal" (toJson tacticParams)
-        let termPromise ← ofile.worker.request "$/lean/plainTermGoal" (toJson termParams)
-        let tacticJson ← waitPromiseTimeout tacticPromise timeoutMs
-        let termJson ← waitPromiseTimeout termPromise timeoutMs
-        let tacticGoal? ← exceptToIO <| fromJson? (α := Option PlainGoal) tacticJson
-        let termGoal? ← exceptToIO <| fromJson? (α := Option PlainTermGoal) termJson
+        let goals ← ofile.queryPlainGoals pos timeoutMs
         let fields := [
           ("module", toJson moduleName),
           ("file", toJson ofile.path.toString),
           ("uri", toJson ofile.uri),
           ("version", toJson version),
           ("position", positionJson1 pos),
-          ("tacticGoals", tacticGoal?.map plainGoalJson |>.getD Json.null),
-          ("termGoal", termGoal?.map plainTermGoalJson |>.getD Json.null)]
+          ("tacticGoals", goals.tacticGoal?.map plainGoalJson |>.getD Json.null),
+          ("termGoal", goals.termGoal?.map plainTermGoalJson |>.getD Json.null)]
         let fields := match restartReason? with
           | some reason => fields ++ [("restarted", toJson true), ("restartReason", toJson reason)]
           | none => fields
@@ -1258,15 +1302,117 @@ partial def Manager.goalsCore (m : Manager) (moduleName : String) (pos : Lsp.Pos
 partial def Manager.goals (m : Manager) (moduleName : String) (line column : Nat) (timeoutMs : Nat := 30000)
     (retry := true) (refresh := false) (closeAfter := false) (ttlMs? : Option Nat := none) : IO Json := do
   let pos ← exceptToIO <| lspPositionFromLineColumn line column
-  let path? ← try some <$> resolveModuleOrFile m.projectRoot moduleName catch _ => pure none
+  let path ← resolveModuleOrFile m.projectRoot moduleName
+  let operationFile ← m.ensureOpen path.toString ttlMs?
   try
-    Manager.goalsCore m moduleName pos timeoutMs retry refresh ttlMs?
+    operationFile.withOperation <|
+      Manager.goalsCore m moduleName pos timeoutMs retry refresh ttlMs?
   finally
     if closeAfter then
       try
-        if let some path := path? then
-          if let some ofile ← m.getOpen? path then
-            discard <| m.closeOpenFile ofile
+        if let some ofile ← m.getOpen? path then
+          discard <| m.closeOpenFile ofile
+      catch _ => pure ()
+
+/-- True when an LSP position denotes an actual position in the document. -/
+def validDocumentPosition (fileMap : FileMap) (pos : Lsp.Position) : Bool :=
+  if pos.line >= fileMap.getLastLine then
+    false
+  else
+    let offset := fileMap.lspPosToUtf8Pos pos
+    let roundTrip := fileMap.utf8PosToLspPos offset
+    roundTrip.line == pos.line && roundTrip.character == pos.character
+
+/-- Validate a probe replacement range against the baseline document. -/
+def validateProbeRange (fileMap : FileMap) (range : Lsp.Range) : Except String Unit := do
+  unless validDocumentPosition fileMap range.start do
+    throw s!"invalid probe range start {range.start.line + 1}:{range.start.character + 1}"
+  unless validDocumentPosition fileMap range.«end» do
+    throw s!"invalid probe range end {range.end.line + 1}:{range.end.character + 1}"
+  let startOffset := fileMap.lspPosToUtf8Pos range.start
+  let endOffset := fileMap.lspPosToUtf8Pos range.«end»
+  if endOffset < startOffset then
+    throw "probe range end precedes its start"
+
+/-- Restore an open worker to the latest text on disk after a temporary probe. -/
+def Manager.restoreAfterProbe (m : Manager) (path : FilePath) (timeoutMs : Nat) : IO Unit := do
+  let some ofile ← m.getOpen? path
+    | return
+  let ofile ← match ← ofile.worker.statusRef.get with
+    | .running => m.syncFileFromDisk ofile
+    | .terminated _ | .crashed _ => m.restartFileFromDisk ofile
+  discard <| ofile.waitForDiagnosticsVersion timeoutMs
+  ofile.updateImportSnapshot m.projectRoot
+
+/-- Apply a candidate replacement in memory, inspect it, and restore the source from disk. -/
+def Manager.probeCore (m : Manager) (target : String) (replacementRange : Lsp.Range)
+    (replacement : String) (goalsAt? : Option Lsp.Position) (timeoutMs : Nat := 30000)
+    (includeRaw : Bool := false) (refresh := false) (ttlMs? : Option Nat := none) : IO Json := do
+  m.touch
+  let path ← resolveModuleOrFile m.projectRoot target
+  let ofile ← m.ensureOpen path.toString ttlMs?
+  let ofile ← m.syncFileFromDisk ofile
+  let (ofile, _) ← m.maybeRestartForDiagnostics ofile refresh
+  let baseline ← ofile.lastTextRef.get
+  let baselineMap := baseline.toFileMap
+  exceptToIO <| validateProbeRange baselineMap replacementRange
+  let candidate := (Lean.Server.replaceLspRange baselineMap replacementRange replacement).source
+  try
+    let candidateVersion ← ofile.sendFullTextChange candidate
+    let version ← ofile.waitForDiagnosticsVersion timeoutMs
+    let status ← ofile.worker.statusRef.get
+    match status with
+    | .terminated 2 =>
+        throw <| IO.userError "worker requested restart after probe changed an import or header"
+    | .terminated code =>
+        throw <| IO.userError s!"worker exited with code {code}"
+    | .crashed msg =>
+        throw <| IO.userError msg
+    | .running =>
+        let diags? ← ofile.worker.latestDiagnosticsRef.get
+        let diags := diags?.map (·.diagnostics) |>.getD #[]
+        let accepted := !diags.any fun d => d.severity? == some .error
+        let mut fields : List (String × Json) := [
+          ("target", target),
+          ("file", ofile.path.toString),
+          ("uri", ofile.uri),
+          ("candidateVersion", candidateVersion),
+          ("version", version),
+          ("replacementRange", rangeJson1 replacementRange),
+          ("accepted", accepted),
+          ("diagnostics", toJson <| diags.map (diagnosticJson ofile.path.toString includeRaw)),
+          ("restored", true)]
+        if let some pos := goalsAt? then
+          fields := fields ++ [("goalsPosition", positionJson1 pos)]
+          try
+            let goals ← ofile.queryPlainGoals pos timeoutMs
+            fields := fields ++ [
+              ("tacticGoals", goals.tacticGoal?.map plainGoalJson |>.getD Json.null),
+              ("termGoal", goals.termGoal?.map plainTermGoalJson |>.getD Json.null)]
+          catch e =>
+            fields := fields ++ [
+              ("tacticGoals", Json.null),
+              ("termGoal", Json.null),
+              ("goalError", e.toString)]
+        return Json.mkObj fields
+  finally
+    m.restoreAfterProbe path timeoutMs
+
+/-- Run a serialized probe transaction and optionally release its worker afterwards. -/
+def Manager.probe (m : Manager) (target : String) (replacementRange : Lsp.Range)
+    (replacement : String) (goalsAt? : Option Lsp.Position) (timeoutMs : Nat := 30000)
+    (includeRaw := false) (refresh := false) (closeAfter := false)
+    (ttlMs? : Option Nat := none) : IO Json := do
+  let path ← resolveModuleOrFile m.projectRoot target
+  let operationFile ← m.ensureOpen path.toString ttlMs?
+  try
+    operationFile.withOperation <|
+      m.probeCore target replacementRange replacement goalsAt? timeoutMs includeRaw refresh ttlMs?
+  finally
+    if closeAfter then
+      try
+        if let some ofile ← m.getOpen? path then
+          discard <| m.closeOpenFile ofile
       catch _ => pure ()
 
 /-- Explicitly restart a file worker, opening the file if necessary. -/
@@ -1405,6 +1551,29 @@ def Manager.handle (m : Manager) (req : Json) : IO Json := do
         let closeAfter := (getBoolField? params "closeAfter" |>.getD false) || (getBoolField? params "transient" |>.getD false)
         let ttlMs? := getNatField? params "ttlMs"
         return okResponse (← m.diagnostics file timeoutMs includeRaw (refresh := refresh) (closeAfter := closeAfter) (ttlMs? := ttlMs?))
+    | "probe" =>
+        let target ← exceptToIO <| getStringField params "target"
+        let replacement ← exceptToIO <| getStringField params "replacement"
+        let startLine ← exceptToIO <| getObjValAs? Nat params "startLine"
+        let startColumn ← exceptToIO <| getObjValAs? Nat params "startColumn"
+        let endLine ← exceptToIO <| getObjValAs? Nat params "endLine"
+        let endColumn ← exceptToIO <| getObjValAs? Nat params "endColumn"
+        let replacementRange : Lsp.Range := {
+          start := ← exceptToIO <| lspPositionFromLineColumn startLine startColumn
+          «end» := ← exceptToIO <| lspPositionFromLineColumn endLine endColumn
+        }
+        let goalsAt? ← exceptToIO <| match getNatField? params "goalLine", getNatField? params "goalColumn" with
+          | none, none => .ok none
+          | some line, some column => some <$> lspPositionFromLineColumn line column
+          | _, _ => .error "probe requires both goalLine and goalColumn"
+        let timeoutMs := getNatField? params "timeoutMs" |>.getD 30000
+        let includeRaw := getBoolField? params "includeRawLsp" |>.getD false
+        let refresh := getBoolField? params "refresh" |>.getD false
+        let closeAfter := (getBoolField? params "closeAfter" |>.getD false) ||
+          (getBoolField? params "transient" |>.getD false)
+        let ttlMs? := getNatField? params "ttlMs"
+        return okResponse (← m.probe target replacementRange replacement goalsAt? timeoutMs
+          includeRaw refresh closeAfter ttlMs?)
     | "goals" =>
         let moduleName ← exceptToIO <| getStringField params "module"
         let line ← exceptToIO <| getObjValAs? Nat params "line"
@@ -1755,6 +1924,8 @@ def cliHelp : String :=
 Commands:
   open [options] <file>          Warm up/open a Lean file worker (open options precede file).
   diagnostics [options] <file>   Elaborate file and print diagnostics as JSON.
+  probe [options] <module-or-file>
+                                Temporarily replace a source range and elaborate it in memory.
   goals [options] <module> <line> <column>
                                 Return term/tactic goals at a 1-based module location.
   restart <file>                 Restart a file worker and reload imports/dependencies.
@@ -1768,16 +1939,143 @@ Commands:
 Options:
   --timeout-ms <n>               Diagnostics/request timeout.
   --raw-lsp                      Include raw LSP diagnostics.
-  --refresh                      Restart worker before diagnostics/goals.
+  --refresh                      Restart worker before diagnostics/probe/goals.
   --transient | --close-after    Close the worker after the request.
   --ttl-ms <n>                   Set/renew a worker lease.
   --dependency-build-mode <m>    always | once | never (open only).
+
+Probe options:
+  --range <l:c-l:c>              Replace this 1-based, end-exclusive source range.
+  --at <line:column>             Insert at a 1-based source position.
+  --stdin                        Read replacement text from standard input.
+  --text <text>                  Use replacement text from one argument.
+  --goals-at <line:column>       Also query tactic and term goals in the candidate.
 "
 
 /-- Parse an option with a following value. -/
 def takeOptionValue (opt : String) : List String → Except String (String × List String)
   | value :: rest => .ok (value, rest)
   | [] => .error s!"missing value after {opt}"
+
+/-- Parsed arguments for the `probe` command. Source positions remain 1-based here. -/
+structure ProbeCliConfig where
+  target : String
+  startLine : Nat
+  startColumn : Nat
+  endLine : Nat
+  endColumn : Nat
+  goalsAt? : Option (Nat × Nat)
+  replacement? : Option String
+  readStdin : Bool
+  timeoutMs : Nat
+  includeRaw : Bool
+  refresh : Bool
+  closeAfter : Bool
+  ttlMs? : Option Nat
+
+/-- Run the transactional in-memory probe CLI command. -/
+partial def runProbeCli (args : List String) : IO UInt32 := do
+  let finalize (target? : Option String) (range? : Option (Nat × Nat × Nat × Nat))
+      (goalsAt? : Option (Nat × Nat)) (replacement? : Option String) (readStdin : Bool)
+      (timeoutMs : Nat) (includeRaw refresh closeAfter : Bool) (ttlMs? : Option Nat)
+      : Except String ProbeCliConfig := do
+    let some target := target? | throw "probe requires <module-or-file>"
+    let some (startLine, startColumn, endLine, endColumn) := range?
+      | throw "probe requires --range <line:column-line:column> or --at <line:column>"
+    if readStdin && replacement?.isSome then
+      throw "probe accepts exactly one of --stdin or --text"
+    if !readStdin && replacement?.isNone then
+      throw "probe requires replacement text via --stdin or --text"
+    return {
+      target, startLine, startColumn, endLine, endColumn, goalsAt?, replacement?, readStdin,
+      timeoutMs, includeRaw, refresh, closeAfter, ttlMs?
+    }
+  let rec parse (args : List String) (target? : Option String)
+      (range? : Option (Nat × Nat × Nat × Nat)) (goalsAt? : Option (Nat × Nat))
+      (replacement? : Option String) (readStdin : Bool) (timeoutMs : Nat)
+      (includeRaw refresh closeAfter : Bool) (ttlMs? : Option Nat)
+      : Except String ProbeCliConfig := do
+    match args with
+    | [] =>
+        finalize target? range? goalsAt? replacement? readStdin timeoutMs
+          includeRaw refresh closeAfter ttlMs?
+    | "--range" :: rest =>
+        let (value, rest) ← takeOptionValue "--range" rest
+        parse rest target? (some (← parseRangeString value)) goalsAt? replacement? readStdin
+          timeoutMs includeRaw refresh closeAfter ttlMs?
+    | "--at" :: rest =>
+        let (value, rest) ← takeOptionValue "--at" rest
+        let (line, column) ← parseLineColumnString value
+        parse rest target? (some (line, column, line, column)) goalsAt? replacement? readStdin
+          timeoutMs includeRaw refresh closeAfter ttlMs?
+    | "--goals-at" :: rest =>
+        let (value, rest) ← takeOptionValue "--goals-at" rest
+        parse rest target? range? (some (← parseLineColumnString value)) replacement? readStdin
+          timeoutMs includeRaw refresh closeAfter ttlMs?
+    | "--stdin" :: rest =>
+        parse rest target? range? goalsAt? replacement? true timeoutMs includeRaw refresh closeAfter ttlMs?
+    | "--text" :: rest =>
+        let (value, rest) ← takeOptionValue "--text" rest
+        parse rest target? range? goalsAt? (some value) readStdin timeoutMs includeRaw refresh closeAfter ttlMs?
+    | "--timeout-ms" :: rest =>
+        let (value, rest) ← takeOptionValue "--timeout-ms" rest
+        let some n := value.toNat? | throw s!"invalid timeout `{value}`"
+        parse rest target? range? goalsAt? replacement? readStdin n includeRaw refresh closeAfter ttlMs?
+    | "--raw-lsp" :: rest =>
+        parse rest target? range? goalsAt? replacement? readStdin timeoutMs true refresh closeAfter ttlMs?
+    | "--refresh" :: rest =>
+        parse rest target? range? goalsAt? replacement? readStdin timeoutMs includeRaw true closeAfter ttlMs?
+    | "--transient" :: rest | "--close-after" :: rest =>
+        parse rest target? range? goalsAt? replacement? readStdin timeoutMs includeRaw refresh true ttlMs?
+    | "--ttl-ms" :: rest =>
+        let (value, rest) ← takeOptionValue "--ttl-ms" rest
+        let some n := value.toNat? | throw s!"invalid ttl `{value}`"
+        parse rest target? range? goalsAt? replacement? readStdin timeoutMs includeRaw refresh closeAfter (some n)
+    | arg :: rest =>
+        if arg.startsWith "--range=" then
+          parse rest target? (some (← parseRangeString (arg.drop "--range=".length).toString))
+            goalsAt? replacement? readStdin timeoutMs includeRaw refresh closeAfter ttlMs?
+        else if arg.startsWith "--at=" then
+          let (line, column) ← parseLineColumnString (arg.drop "--at=".length).toString
+          parse rest target? (some (line, column, line, column)) goalsAt? replacement? readStdin
+            timeoutMs includeRaw refresh closeAfter ttlMs?
+        else if arg.startsWith "--goals-at=" then
+          parse rest target? range? (some (← parseLineColumnString
+            (arg.drop "--goals-at=".length).toString)) replacement? readStdin timeoutMs
+            includeRaw refresh closeAfter ttlMs?
+        else if arg.startsWith "-" then
+          throw s!"unknown probe option `{arg}`"
+        else if target?.isSome then
+          throw s!"too many positional arguments: `{arg}`"
+        else
+          parse rest (some arg) range? goalsAt? replacement? readStdin timeoutMs
+            includeRaw refresh closeAfter ttlMs?
+  match parse args none none none none false 30000 false false false none with
+  | .error e => IO.eprintln s!"error: {e}\n\n{cliHelp}"; return 1
+  | .ok config =>
+      let replacement ← if config.readStdin then (← IO.getStdin).readToEnd else pure config.replacement?.get!
+      let root ← if looksLikeLeanFilePath config.target then
+          findProjectRoot (some (FilePath.mk config.target))
+        else
+          findProjectRoot none
+      let some md ← getDaemon root true | throw <| IO.userError "failed to start daemon"
+      let mut fields : List (String × Json) := [
+        ("target", config.target),
+        ("replacement", replacement),
+        ("startLine", config.startLine),
+        ("startColumn", config.startColumn),
+        ("endLine", config.endLine),
+        ("endColumn", config.endColumn),
+        ("timeoutMs", config.timeoutMs),
+        ("includeRawLsp", config.includeRaw),
+        ("refresh", config.refresh),
+        ("closeAfter", config.closeAfter)]
+      if let some (line, column) := config.goalsAt? then
+        fields := fields ++ [("goalLine", toJson line), ("goalColumn", toJson column)]
+      if let some ttlMs := config.ttlMs? then
+        fields := fields ++ [("ttlMs", toJson ttlMs)]
+      printDaemonResponse (← sendToDaemon md "probe" (Json.mkObj fields)
+        (config.timeoutMs * 2 + 5000))
 
 /-- Run the diagnostics CLI command. -/
 partial def runDiagnosticsCli (args : List String) : IO UInt32 := do
@@ -1950,6 +2248,8 @@ partial def runCli (cmd : String) (args : List String) : IO UInt32 := do
       runDiagnosticsCli args
   | "diag" =>
       runDiagnosticsCli args
+  | "probe" =>
+      runProbeCli args
   | "goals" | "goal" =>
       runGoalsCli args
   | "restart" | "refresh" =>
@@ -2019,7 +2319,7 @@ partial def runCli (cmd : String) (args : List String) : IO UInt32 := do
 /-- True for top-level CLI commands handled by `AFTK.Server`. -/
 def isCommand (cmd : String) : Bool :=
   cmd == "daemon" || cmd == "open" || cmd == "diagnostics" || cmd == "diag" ||
-    cmd == "goals" || cmd == "goal" || cmd == "restart" || cmd == "refresh" ||
+    cmd == "probe" || cmd == "goals" || cmd == "goal" || cmd == "restart" || cmd == "refresh" ||
     cmd == "close" || cmd == "gc" || cmd == "status" || cmd == "shutdown"
 
 end Server
