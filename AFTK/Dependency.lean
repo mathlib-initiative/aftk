@@ -2,6 +2,7 @@ module
 
 public import Lean
 public import AFTK.Server
+public import AFTK.TechDebt
 
 public section
 
@@ -188,6 +189,7 @@ def topLevelHelp : String :=
 Usage:
   lake exe aftk deps [options] <module> <declaration>
   lake exe aftk rdeps [options] <module> <declaration>
+  lake exe aftk tech-debt [options] <module>
   lake exe aftk diagnostics [options] <file>
   lake exe aftk goals [options] <module> <line> <column>
   lake exe aftk open [options] <file>
@@ -204,6 +206,7 @@ Usage:
 Commands:
   deps          Display declarations that are transitive dependencies of a declaration.
   rdeps         Display declarations that transitively depend on a declaration.
+  tech-debt     Find technical debt in a Lean module using elaborator info trees.
   open          Warm up/open a Lean file worker in the project daemon.
   diagnostics   Elaborate a Lean file and print diagnostics as JSON.
   goals        Return term/tactic goals at a 1-based module location.
@@ -624,14 +627,28 @@ def run (args : List String) : IO UInt32 := do
           IO.println (subcommandHelp kind)
           return (0 : UInt32)
       | none =>
-          if Server.isCommand cmd then
+          if cmd == "tech-debt" || cmd == "techdebt" then
+            IO.println TechDebt.cliHelp
+            return (0 : UInt32)
+          else if Server.isCommand cmd then
             IO.println Server.cliHelp
             return (0 : UInt32)
           else
             IO.eprintln s!"unknown command `{cmd}`\n\n{topLevelHelp}"
             return (1 : UInt32)
   | cmd :: rest =>
-      if Server.isCommand cmd then
+      if cmd == "tech-debt" || cmd == "techdebt" then
+        match TechDebt.parseArgs rest with
+        | .ok none =>
+            IO.println TechDebt.cliHelp
+            return (0 : UInt32)
+        | .ok (some config) =>
+            TechDebt.run config
+            return (0 : UInt32)
+        | .error msg =>
+            IO.eprintln s!"error: {msg}\n\n{TechDebt.cliHelp}"
+            return (1 : UInt32)
+      else if Server.isCommand cmd then
         Server.runCli cmd rest
       else
       match parseQueryKind cmd with

@@ -5,6 +5,7 @@ AFTK provides the `aftk` Lake executable for dependency analysis of Lean declara
 ```bash
 lake exe aftk deps [options] <module> <declaration>
 lake exe aftk rdeps [options] <module> <declaration>
+lake exe aftk tech-debt [options] <module>
 
 lake exe aftk diagnostics [options] <file>
 lake exe aftk goals [options] <module> <line> <column>
@@ -72,3 +73,20 @@ Resource management is built in for multi-agent use:
 Run `lake exe aftk --help` or `lake exe aftk <command> --help` for full help.
 
 For large imports such as Mathlib, prefer using module filters with `rdeps`.
+
+## Technical-debt detection
+
+`tech-debt` elaborates a Lean module, traverses its info trees, and reports recognized technical
+debt with 1-based source locations. It currently detects commands that set `maxHeartbeats` and
+uses of Core Lean's `erw` tactic.
+
+```bash
+lake exe aftk tech-debt A.B.C
+lake exe aftk tech-debt A.B.C --jsonl
+```
+
+The default output is tab-separated:
+
+```text
+<file>:<line>:<column>\t<kind>\t<description>
+```
