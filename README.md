@@ -151,6 +151,17 @@ Run `lake exe aftk --help` or `lake exe aftk <command> --help` for full help.
 
 For large imports such as Mathlib, prefer using module filters with `rdeps`.
 
+## Agent skill
+
+[`skills/aftk/SKILL.md`](skills/aftk/SKILL.md) is a self-contained skill for coding agents (Claude
+Code / agentskills format) that use AFTK from a consuming project: a command cheat-sheet, four
+workflows (library-wide debt inventory, declaration-level blast radius and leaf detection, proof
+iteration through the daemon, cross-checking a textual tracker), and the gotchas that are not
+obvious from `--help`. Two helper scripts live next to it: `scripts/scan_modules.sh` (per-module,
+parallel `tech-debt` over a whole library) and `scripts/rdeps_batch.sh` (parallel `rdeps` over a
+list of declaration names). Copy or symlink the directory into a project's `.claude/skills/` to
+make it available there.
+
 ## Technical-debt detection
 
 `tech-debt` elaborates Lean modules, traverses their info trees, and reports configured technical-debt markers with 1-based source locations. Every invocation must select findings explicitly with `--markers`, `--all-markers`, or `--option`; there are no default markers.
