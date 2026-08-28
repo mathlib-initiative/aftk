@@ -173,9 +173,18 @@ structure Finding where
   kind : Kind
   start : Position
   stop : Position
+  /-- User-facing names of the declarations governed by this occurrence. -/
+  declarations : Array Name := #[]
   detail? : Option String := none
   scope? : Option FindingScope := none
+  optionName? : Option Name := none
+  optionValue? : Option String := none
+  /-- Versioned semantic identity assigned after findings have been ordered and deduplicated. -/
+  key : String := ""
   deriving Inhabited
+
+/-- Current version of the persisted semantic finding-key format. -/
+def findingKeyVersion : Nat := 1
 
 /-- A command-line selector for option names. -/
 inductive OptionSelector where
@@ -266,8 +275,9 @@ Markers:
 Output:
   By default: <file>:<line>:<column>\t<kind>\t<description>[\t<detail>].
   Positions are 1-based. Module failures are written to standard error.
-  With --jsonl, findings and failures are discriminated by `type`; failure records include
-  `module`, `phase`, and `diagnostic`."
+  With --jsonl, findings include declaration ownership, structured option metadata, and a
+  versioned semantic key. Findings and failures are discriminated by `type`; failure records
+  include `module`, `phase`, and `diagnostic`."
 
 /-- Interpret positional arguments as a scan scope. -/
 def parseScope (positionals : Array String) : Except String Scope := do
@@ -606,9 +616,13 @@ structure SetOptionSyntax where
   value : Syntax
   stx : Syntax
 
+/-- Reprinted option value without the option name. -/
+def SetOptionSyntax.optionValue (option : SetOptionSyntax) : String :=
+  option.value.reprint.getD "" |>.trimAscii.toString
+
 /-- Reprinted option name and value for tracker-friendly output. -/
 def SetOptionSyntax.detail (option : SetOptionSyntax) : String :=
-  s!"{option.optionName} {option.value.reprint.getD "" |>.trimAscii}"
+  s!"{option.optionName} {option.optionValue}"
 
 /-- Parse a `set_option` syntax node, including a command wrapped in `... in`. -/
 partial def setOptionSyntax? (stx : Syntax) : Option SetOptionSyntax :=
@@ -667,6 +681,10 @@ structure SyntaxMarker where
   stx : Syntax
   detail? : Option String := none
   scope? : Option FindingScope := none
+  optionName? : Option Name := none
+  optionValue? : Option String := none
+  /-- Whether a command marker governs declarations introduced in its info-tree subtree. -/
+  declarationsFromCommand : Bool := false
 
 /-- Construct a marker with no option-specific metadata. -/
 def syntaxMarker (kind : Kind) (stx : Syntax) : SyntaxMarker := { kind, stx }
@@ -676,14 +694,24 @@ def setOptionMarkers (option : SetOptionSyntax) (scope : FindingScope)
     (selectors : Array OptionSelector) : Array SyntaxMarker := Id.run do
   let mut markers := #[]
   let detail := option.detail
+  let optionValue := option.optionValue
   if let some kind := setOptionKind? option then
-    markers := markers.push { kind, stx := option.stx, detail? := some detail, scope? := some scope }
+    markers := markers.push {
+      kind
+      stx := option.stx
+      detail? := some detail
+      scope? := some scope
+      optionName? := some option.optionName
+      optionValue? := some optionValue
+    }
   if selectors.any (·.accepts option.optionName) then
     markers := markers.push {
       kind := .option
       stx := option.stx
       detail? := some detail
       scope? := some scope
+      optionName? := some option.optionName
+      optionValue? := some optionValue
     }
   return markers
 
@@ -785,6 +813,13 @@ def commandMarkers (stx : Syntax) (selectors : Array OptionSelector) : Array Syn
     markers := markers.push (syntaxMarker .deprecated head)
   if commandAttributes?.any (hasAttributeWithArgument · `nolint `simpNF) then
     markers := markers.push (syntaxMarker .simpNF head)
+  let governsIntroducedDeclarations :=
+    stx.isOfKind ``Lean.Parser.Command.in ||
+      isDeclarationKind head ``Lean.Parser.Command.axiom ||
+      (head.isOfKind ``Lean.Parser.Command.declaration &&
+        commandAttributes?.isSome)
+  if governsIntroducedDeclarations then
+    markers := markers.map fun marker => { marker with declarationsFromCommand := true }
   return markers
 
 /-- Collect supported markers represented by a tactic info node. -/
@@ -817,7 +852,7 @@ def termMarkers (stx : Syntax) (selectors : Array OptionSelector) : Array Syntax
 
 /-- Build a finding from syntax that has a canonical source range. -/
 def findingOfSyntax? (moduleName : Name) (file : String) (fileMap : FileMap)
-    (marker : SyntaxMarker) : Option Finding := do
+    (declarations : Array Name) (marker : SyntaxMarker) : Option Finding := do
   let range ← marker.stx.getRange? (canonicalOnly := true)
   let start := fileMap.toPosition range.start
   let stop := fileMap.toPosition range.stop
@@ -827,45 +862,105 @@ def findingOfSyntax? (moduleName : Name) (file : String) (fileMap : FileMap)
     kind := marker.kind
     start := { start with column := start.column + 1 }
     stop := { stop with column := stop.column + 1 }
+    declarations
     detail? := marker.detail?
     scope? := marker.scope?
+    optionName? := marker.optionName?
+    optionValue? := marker.optionValue?
   }
 
 /-- Add enabled syntax markers to a finding collection. -/
 def addSyntaxMarkers (moduleName : Name) (file : String) (fileMap : FileMap)
     (enabledMarkers : Array Kind) (syntaxMarkers : Array SyntaxMarker)
+    (declarations introducedDeclarations : Array Name)
     (findings : Array Finding) : Array Finding := Id.run do
   let mut findings := findings
   for marker in syntaxMarkers do
     if enabledMarkers.contains marker.kind || marker.kind == .option then
-      if let some finding := findingOfSyntax? moduleName file fileMap marker then
+      let declarations := if declarations.isEmpty && marker.declarationsFromCommand then
+        introducedDeclarations
+      else
+        declarations
+      if let some finding := findingOfSyntax? moduleName file fileMap declarations marker then
         findings := findings.push finding
   return findings
+
+/-- Add a declaration name once, converting private implementation names to source-facing names. -/
+def addDeclaration (declarations : Array Name) (declaration : Name) : Array Name :=
+  let declaration := privateToUserName declaration
+  if declarations.contains declaration then declarations else declarations.push declaration
+
+/-- Collect source declaration contexts below a command info node in their info-tree order. -/
+partial def descendantDeclarations (tree : InfoTree) (declarations : Array Name := #[]) : Array Name :=
+  match tree with
+  | .context (.parentDeclCtx declaration) tree =>
+      descendantDeclarations tree (addDeclaration declarations declaration)
+  | .context _ tree => descendantDeclarations tree declarations
+  | .hole _ => declarations
+  | .node _ children =>
+      children.foldl (fun declarations child => descendantDeclarations child declarations) declarations
+
+/-- True for a source declaration command, excluding declarations produced only by macro expansion. -/
+def isSourceDeclarationCommand (stx : Syntax) : Bool :=
+  (stx.isOfKind ``Lean.Parser.Command.declaration ||
+    stx.isOfKind ``Lean.Parser.Command.mutual) &&
+    (stx.getRange? (canonicalOnly := true)).isSome
+
+/-- Collect owners introduced by source declaration commands below a possibly scoped command. -/
+partial def sourceCommandDeclarations (tree : InfoTree)
+    (declarations : Array Name := #[]) : Array Name :=
+  match tree with
+  | .context _ tree => sourceCommandDeclarations tree declarations
+  | .hole _ => declarations
+  | .node info children =>
+      match info with
+      | .ofCommandInfo commandInfo =>
+          if isSourceDeclarationCommand commandInfo.stx then
+            descendantDeclarations tree declarations
+          else
+            children.foldl
+              (fun declarations child => sourceCommandDeclarations child declarations) declarations
+      | _ =>
+          children.foldl
+            (fun declarations child => sourceCommandDeclarations child declarations) declarations
 
 /-- Collect findings from one info tree. -/
 partial def collectTree (moduleName : Name) (file : String) (fileMap : FileMap)
     (enabledMarkers : Array Kind) (optionSelectors : Array OptionSelector)
-    (tree : InfoTree) (findings : Array Finding) : Array Finding :=
+    (tree : InfoTree) (findings : Array Finding)
+    (parentDeclaration? : Option Name := none) : Array Finding :=
   match tree with
+  | .context (.parentDeclCtx declaration) tree =>
+      collectTree moduleName file fileMap enabledMarkers optionSelectors tree findings
+        (some (privateToUserName declaration))
   | .context _ tree =>
       collectTree moduleName file fileMap enabledMarkers optionSelectors tree findings
+        parentDeclaration?
   | .hole _ => findings
   | .node info children =>
+      let declarations := parentDeclaration?.map (#[·]) |>.getD #[]
       let findings :=
         match info with
         | .ofCommandInfo commandInfo =>
+            let markers := commandMarkers commandInfo.stx optionSelectors
+            let introducedDeclarations :=
+              if declarations.isEmpty && markers.any (·.declarationsFromCommand) then
+                sourceCommandDeclarations tree
+              else
+                #[]
             addSyntaxMarkers moduleName file fileMap enabledMarkers
-              (commandMarkers commandInfo.stx optionSelectors) findings
+              markers declarations introducedDeclarations findings
         | .ofTacticInfo tacticInfo =>
             addSyntaxMarkers moduleName file fileMap enabledMarkers
-              (tacticMarkers tacticInfo.stx optionSelectors) findings
+              (tacticMarkers tacticInfo.stx optionSelectors) declarations #[] findings
         | .ofTermInfo termInfo =>
             addSyntaxMarkers moduleName file fileMap enabledMarkers
-              (termMarkers termInfo.stx optionSelectors) findings
+              (termMarkers termInfo.stx optionSelectors) declarations #[] findings
         | _ => findings
       children.foldl
         (fun findings child =>
-          collectTree moduleName file fileMap enabledMarkers optionSelectors child findings) findings
+          collectTree moduleName file fileMap enabledMarkers optionSelectors child findings
+            parentDeclaration?) findings
 
 /-- True when two findings describe the same source occurrence. -/
 def Finding.sameOccurrence (a b : Finding) : Bool :=
@@ -888,6 +983,37 @@ def lessWithinModule (a b : Finding) : Bool :=
   else
     a.kind.name < b.kind.name
 
+/-- Semantic key components other than the occurrence ordinal. Source paths and ranges are excluded. -/
+def Finding.keyBasis (finding : Finding) : Json :=
+  Json.arr #[
+    Json.str (toString finding.moduleName),
+    Json.arr (finding.declarations.map fun declaration => Json.str (toString declaration)),
+    Json.str finding.kind.name,
+    Json.mkObj [
+      ("detail", finding.detail?.map Json.str |>.getD Json.null),
+      ("scope", finding.scope?.map (Json.str ·.name) |>.getD Json.null),
+      ("optionName", finding.optionName?.map (Json.str ∘ toString) |>.getD Json.null),
+      ("optionValue", finding.optionValue?.map Json.str |>.getD Json.null)]]
+
+/-- Version-one key for an occurrence ordinal local to equal semantic key components. -/
+def Finding.stableKey (finding : Finding) (ordinal : Nat) : String :=
+  match finding.keyBasis with
+  | .arr components =>
+      s!"aftk-tech-debt-v{findingKeyVersion}:" ++
+        Json.compress (Json.arr (components.push (toJson ordinal)))
+  | _ => ""
+
+/-- Assign stable semantic keys in source order after duplicate info-tree nodes are removed. -/
+def assignStableKeys (findings : Array Finding) : Array Finding := Id.run do
+  let mut keyed := #[]
+  let mut ordinals : Std.HashMap String Nat := {}
+  for finding in findings do
+    let basis := Json.compress finding.keyBasis
+    let ordinal := ordinals.getD basis 0
+    ordinals := ordinals.insert basis (ordinal + 1)
+    keyed := keyed.push { finding with key := finding.stableKey ordinal }
+  return keyed
+
 /-- The explicit outcome of scanning one module. -/
 inductive ModuleScanResult where
   | success (findings : Array Finding)
@@ -908,7 +1034,7 @@ def findModuleInWorkspaceResult (workspace : Lake.Workspace) (moduleName : Name)
       let mut findings := #[]
       for tree in trees do
         findings := collectTree moduleName path.toString fileMap enabledMarkers optionSelectors tree findings
-      return (deduplicate findings).qsort lessWithinModule
+      return assignStableKeys <| (deduplicate findings).qsort lessWithinModule
   match result with
   | .ok findings => return .success findings
   | .error failure => return .failure failure
@@ -972,6 +1098,9 @@ def formatFindingJsonLine (finding : Finding) : String :=
     ("file", finding.file),
     ("kind", finding.kind.name),
     ("description", finding.kind.description),
+    ("declarations", Json.arr <| finding.declarations.map (Json.str ∘ toString)),
+    ("keyVersion", findingKeyVersion),
+    ("key", finding.key),
     ("range", Json.mkObj [
       ("start", Json.mkObj [("line", finding.start.line), ("column", finding.start.column)]),
       ("end", Json.mkObj [("line", finding.stop.line), ("column", finding.stop.column)])])]
@@ -980,6 +1109,12 @@ def formatFindingJsonLine (finding : Finding) : String :=
     | none => fields
   let fields := match finding.scope? with
     | some scope => fields ++ [("scope", Json.str scope.name)]
+    | none => fields
+  let fields := match finding.optionName? with
+    | some optionName => fields ++ [("optionName", Json.str (toString optionName))]
+    | none => fields
+  let fields := match finding.optionValue? with
+    | some optionValue => fields ++ [("optionValue", Json.str optionValue)]
     | none => fields
   Json.compress <| Json.mkObj fields
 

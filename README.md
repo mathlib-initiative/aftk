@@ -171,7 +171,23 @@ The default output is tab-separated:
 <file>:<line>:<column>\t<kind>\t<description>[\t<detail>]
 ```
 
-Every option-derived finding includes its reprinted name and value as `detail`. JSONL output also includes its syntactic `scope` (`command`, `term`, or `tactic`); non-option findings omit both fields.
+Every option-derived finding includes its reprinted name and value as `detail`. JSONL output also
+includes separate `optionName` and `optionValue` fields and its syntactic `scope` (`command`,
+`term`, or `tactic`); non-option findings omit those fields. The default TSV format is unchanged.
+
+Every JSONL finding includes `declarations`, an array of source-facing enclosing declaration
+names. Term and tactic findings normally have one owner. Wrapped or grouped commands can have
+multiple owners, while module-level findings use an empty array. Private declarations are shown by
+their user-facing name; the finding's `module` keeps that name unambiguous across modules.
+
+`key` is a machine-readable semantic identity and `keyVersion` identifies its format (currently
+version 1). Version-one keys are based on the module, declaration array (or module scope), kind,
+structured marker detail, and an ordinal among equivalent occurrences in that declaration/scope.
+They deliberately exclude file paths and source ranges, so unrelated line movement and inserting
+an unrelated declaration do not change existing keys. Renaming an owning declaration or inserting
+an equivalent earlier occurrence within the same declaration/scope can change a key. Consumers
+should treat the key as opaque and partition persisted state by `keyVersion`.
+
 JSONL records have `type` set to `finding` or `error`. Error records include the failed `module`,
 the `phase` (`source-resolution`, `parse`, `header`, `elaboration`, or `internal`), and a
 `diagnostic`. In the default text format, module failures are written to standard error.

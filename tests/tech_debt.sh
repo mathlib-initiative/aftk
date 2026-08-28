@@ -316,6 +316,62 @@ module
 -- This file is deliberately outside every configured target.
 set_option maxHeartbeats 400000
 EOF
+cat > "$PROJECT/OwnershipDebt.lean" <<'EOF'
+module
+import TechDebtTest.MarkerSupport
+meta import TechDebtTest.MarkerSupport
+
+namespace Owned
+
+set_option linter.style.longFile 2500
+
+set_option maxHeartbeats 1000 in
+def commandOwned : Nat := 1
+
+def termOwned : Nat := set_option maxRecDepth 100 in 1
+
+theorem tacticOwned : True := by
+  set_option linter.flexible false in
+    trivial
+
+section OwnershipSection
+private def privateOwned : Nat := sorry
+end OwnershipSection
+
+theorem multipleErw (a b : Nat) (h : a = b) : a = b ∧ a = b := by
+  constructor
+  · erw [h]
+  · erw [h]
+
+def replacement : Nat := 1
+
+@[deprecated replacement (since := "2026-01-01")]
+def deprecatedOwned : Nat := replacement
+
+axiom axiomOwned : True
+
+set_option maxHeartbeats 2000 in
+mutual
+  def mutualA : Nat := mutualB
+  def mutualB : Nat := 1
+end
+
+set_option maxHeartbeats 3000 in
+#adaptation_note
+
+end Owned
+EOF
+cat > "$PROJECT/StableDebt.lean" <<'EOF'
+module
+
+set_option maxHeartbeats 1000 in
+def stableCommand : Nat := 1
+
+theorem stableOccurrences (a b : Nat) (h : a = b) : a = b ∧ a = b := by
+  constructor
+  · erw [h]
+  · erw [h]
+EOF
 mkdir -p "$PROJECT/partial-fixture/CustomSource/PartialDebt"
 cat > "$PROJECT/partial-fixture/lakefile.toml" <<'EOF'
 name = "partial_fixture"
@@ -503,6 +559,108 @@ assert [(finding["range"]["start"]["line"], finding["kind"]) for finding in find
     (116, "longFile"),
     (116, "option"),
 ], findings
+PY
+
+printf 'test: tech-debt reports declaration ownership, structured options, and versioned keys\n'
+if ! (cd "$PROJECT" && lake exe aftk tech-debt --jsonl \
+    --markers maxHeartbeats,maxRecDepth,linterFlexible,erw,sorry,deprecated,axiom,adaptationNote,longFile \
+    --option linter.style.longFile module OwnershipDebt > ownership.jsonl); then
+  cat "$PROJECT/ownership.jsonl" >&2
+  exit 1
+fi
+python3 - "$PROJECT/ownership.jsonl" "$PROJECT" <<'PY'
+import json
+import sys
+
+output, project = sys.argv[1:]
+with open(output) as stream:
+    findings = [json.loads(line) for line in stream if line.strip()]
+
+by_kind = {}
+for finding in findings:
+    by_kind.setdefault(finding["kind"], []).append(finding)
+
+assert [(row["kind"], row["declarations"]) for row in findings] == [
+    ("longFile", []),
+    ("option", []),
+    ("maxHeartbeats", ["Owned.commandOwned"]),
+    ("maxRecDepth", ["Owned.termOwned"]),
+    ("linterFlexible", ["Owned.tacticOwned"]),
+    ("sorry", ["Owned.privateOwned"]),
+    ("erw", ["Owned.multipleErw"]),
+    ("erw", ["Owned.multipleErw"]),
+    ("deprecated", ["Owned.deprecatedOwned"]),
+    ("axiom", ["Owned.axiomOwned"]),
+    ("maxHeartbeats", ["Owned.mutualA", "Owned.mutualB"]),
+    ("maxHeartbeats", []),
+    ("adaptationNote", []),
+], findings
+
+option_findings = [row for row in findings if "optionName" in row]
+assert option_findings
+assert all(row["detail"] == f'{row["optionName"]} {row["optionValue"]}' for row in option_findings)
+assert {
+    (row["kind"], row["optionName"], row["optionValue"], row["scope"])
+    for row in option_findings
+} >= {
+    ("longFile", "linter.style.longFile", "2500", "command"),
+    ("option", "linter.style.longFile", "2500", "command"),
+    ("maxHeartbeats", "maxHeartbeats", "1000", "command"),
+    ("maxRecDepth", "maxRecDepth", "100", "term"),
+    ("linterFlexible", "linter.flexible", "false", "tactic"),
+}
+assert all("optionName" not in row and "optionValue" not in row for row in findings if row not in option_findings)
+
+keys = [row["key"] for row in findings]
+assert len(keys) == len(set(keys)), keys
+assert all(row["keyVersion"] == 1 for row in findings)
+assert all(key.startswith("aftk-tech-debt-v1:") for key in keys)
+assert all(project not in key for key in keys)
+assert by_kind["longFile"][0]["key"] != by_kind["option"][0]["key"]
+assert len({row["key"] for row in by_kind["erw"]}) == 2
+PY
+
+printf 'test: tech-debt keys survive unrelated source movement\n'
+(cd "$PROJECT" && lake exe aftk tech-debt --jsonl --markers maxHeartbeats,erw \
+  module StableDebt > stable-before.jsonl)
+python3 - "$PROJECT/StableDebt.lean" <<'PY'
+import sys
+
+path = sys.argv[1]
+with open(path) as stream:
+    source = stream.read()
+insertion = '''
+def unrelatedDeclaration : Nat := 0
+
+theorem unrelatedDebt (a b : Nat) (h : a = b) : a = b := by
+  erw [h]
+
+'''
+assert source.startswith("module\n")
+with open(path, "w") as stream:
+    stream.write("module\n" + insertion + source[len("module\n"):])
+PY
+(cd "$PROJECT" && lake exe aftk tech-debt --jsonl --markers maxHeartbeats,erw \
+  module StableDebt > stable-after.jsonl)
+python3 - "$PROJECT/stable-before.jsonl" "$PROJECT/stable-after.jsonl" <<'PY'
+import json
+import sys
+
+def load(path):
+    with open(path) as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+
+before = load(sys.argv[1])
+after = [
+    row for row in load(sys.argv[2])
+    if row["declarations"] in (["stableCommand"], ["stableOccurrences"])
+]
+assert [(row["declarations"], row["kind"], row["key"]) for row in after] == [
+    (row["declarations"], row["kind"], row["key"]) for row in before
+], (before, after)
+assert [row["range"]["start"]["line"] for row in before] != [
+    row["range"]["start"]["line"] for row in after
+]
 PY
 
 printf 'test: tech-debt validates option selectors\n'
