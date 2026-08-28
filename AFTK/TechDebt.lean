@@ -339,21 +339,35 @@ def ensureNoErrors (moduleName : Name) (messages : MessageLog) : IO Unit := do
         IO.eprintln (← message.toString)
     throw <| IO.userError s!"failed to elaborate module `{moduleName}`"
 
-/-- Elaborate a source module and return its file map and completed info trees. -/
-def moduleInfoTrees (moduleName : Name) (path : System.FilePath) : IO (FileMap × PersistentArray InfoTree) := do
+/-- Return the options Lake uses to build a configured module. -/
+def moduleLeanOptions (workspace : Lake.Workspace) (moduleName : Name) : LeanOptions :=
+  (workspace.findTargetModule? moduleName).map (·.leanOptions) |>.getD {}
+
+/-- Elaborate a source module with the given Lake options and return its completed info trees. -/
+def moduleInfoTreesWithOptions (moduleName : Name) (path : System.FilePath)
+    (leanOptions : LeanOptions) :
+    IO (FileMap × PersistentArray InfoTree) := do
   let input ← IO.FS.readFile path
   let inputCtx := Parser.mkInputContext input path.toString
   let (header, parserState, parseMessages) ← Parser.parseHeader inputCtx
   ensureNoErrors moduleName parseMessages
   unsafe Lean.enableInitializersExecution
-  let (env, headerMessages) ← Elab.processHeader header Options.empty parseMessages inputCtx
+  let options := leanOptions.toOptions
+  let (env, headerMessages) ← Elab.processHeader header options parseMessages inputCtx
     (leakEnv := true) (mainModule := moduleName)
   ensureNoErrors moduleName headerMessages
-  let commandState := Elab.Command.mkState env headerMessages Options.empty
+  let options ← Lean.Language.Lean.reparseOptions options
+  let commandState := Elab.Command.mkState env headerMessages options
   let state ← Elab.IO.processCommands inputCtx parserState commandState
   ensureNoErrors moduleName state.commandState.messages
   let infoState := state.commandState.infoState.substituteLazy.get
   return (inputCtx.fileMap, infoState.trees)
+
+/-- Elaborate a source module with its configured Lake options and return its completed info trees. -/
+def moduleInfoTrees (moduleName : Name) (path : System.FilePath) :
+    IO (FileMap × PersistentArray InfoTree) := do
+  let workspace ← loadProjectWorkspace
+  moduleInfoTreesWithOptions moduleName path (moduleLeanOptions workspace moduleName)
 
 /-- True when a syntax tree contains an atom with the given source spelling. -/
 partial def syntaxContainsAtom (stx : Syntax) (value : String) : Bool :=
@@ -642,10 +656,12 @@ def lessWithinModule (a b : Finding) : Bool :=
   else
     a.kind.name < b.kind.name
 
-/-- Find enabled technical debt in one module. -/
-def findModule (moduleName : Name) (enabledMarkers : Array Kind) : IO (Array Finding) := do
+/-- Find enabled technical debt in one module using an already loaded Lake workspace. -/
+def findModuleInWorkspace (workspace : Lake.Workspace) (moduleName : Name)
+    (enabledMarkers : Array Kind) : IO (Array Finding) := do
   let path ← resolveModuleSource moduleName
-  let (fileMap, trees) ← moduleInfoTrees moduleName path
+  let leanOptions := moduleLeanOptions workspace moduleName
+  let (fileMap, trees) ← moduleInfoTreesWithOptions moduleName path leanOptions
   let mut findings := #[]
   for tree in trees do
     findings := collectTree moduleName path.toString fileMap enabledMarkers tree findings
@@ -658,13 +674,25 @@ def lessForOutput (a b : Finding) : Bool :=
   else
     lessWithinModule a b
 
-/-- Find enabled technical debt in a collection of modules. -/
-def findModules (moduleNames : Array Name) (enabledMarkers : Array Kind) : IO (Array Finding) := do
+/-- Find enabled technical debt in modules using an already loaded Lake workspace. -/
+def findModulesInWorkspace (workspace : Lake.Workspace) (moduleNames : Array Name)
+    (enabledMarkers : Array Kind) : IO (Array Finding) := do
   addProjectLeanSearchPath
   let mut findings := #[]
   for moduleName in normalizeModuleNames moduleNames do
-    findings := findings ++ (← findModule moduleName enabledMarkers)
+    findings := findings ++ (← findModuleInWorkspace workspace moduleName enabledMarkers)
   return findings.qsort lessForOutput
+
+/-- Find enabled technical debt in one module. -/
+def findModule (moduleName : Name) (enabledMarkers : Array Kind) : IO (Array Finding) := do
+  let workspace ← loadProjectWorkspace
+  addProjectLeanSearchPath
+  findModuleInWorkspace workspace moduleName enabledMarkers
+
+/-- Find enabled technical debt in a collection of modules. -/
+def findModules (moduleNames : Array Name) (enabledMarkers : Array Kind) : IO (Array Finding) := do
+  let workspace ← loadProjectWorkspace
+  findModulesInWorkspace workspace moduleNames enabledMarkers
 
 /-- Find enabled technical debt in a module. -/
 def find (moduleName : Name) (enabledMarkers : Array Kind) : IO (Array Finding) :=
@@ -689,7 +717,7 @@ def formatFindingJsonLine (finding : Finding) : String :=
 def run (config : Config) : IO Unit := do
   let workspace ← loadProjectWorkspace
   let moduleNames ← modulesForScope workspace config.scope
-  let findings ← findModules moduleNames config.markers
+  let findings ← findModulesInWorkspace workspace moduleNames config.markers
   for finding in findings do
     if config.jsonl then
       IO.println (formatFindingJsonLine finding)

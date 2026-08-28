@@ -16,6 +16,10 @@ name = "tech_debt_test"
 version = "0.1.0"
 defaultTargets = ["TechDebtTest", "ExtraDebt", "debt_runner"]
 
+[leanOptions]
+weak.maxRecDepth = 2048
+weak.techDebtTest.required = true
+
 [[require]]
 name = "aftk"
 path = "aftk-dependency"
@@ -37,6 +41,7 @@ cat > "$PROJECT/TechDebtTest.lean" <<'EOF'
 module
 import TechDebtTest.Example
 import TechDebtTest.Markers
+import TechDebtTest.OptionRequired
 EOF
 cat > "$PROJECT/TechDebtTest/Dependency.lean" <<'EOF'
 module
@@ -78,6 +83,13 @@ public register_option linter.flexible : Bool := { defValue := true, descr := "t
 public register_option linter.overlappingInstances : Bool := { defValue := true, descr := "test option" }
 public register_option linter.auxLemma : Bool := { defValue := true, descr := "test option" }
 public register_option linter.style.longFile : Nat := { defValue := 1000, descr := "test option" }
+public register_option techDebtTest.required : Bool := { defValue := false, descr := "test option" }
+
+open Lean
+
+elab "#require_option " optionName:ident : command => do
+  unless (← getOptions).getBool optionName.getId false do
+    throwError "required Lake option `{optionName.getId}` was not applied"
 
 public section
 
@@ -110,6 +122,19 @@ end Fin.NatCast
 
 end
 EOF
+cat > "$PROJECT/TechDebtTest/OptionRequired.lean" <<'EOF'
+module
+import TechDebtTest.MarkerSupport
+meta import TechDebtTest.MarkerSupport
+
+#require_option techDebtTest.required
+
+EOF
+printf 'def lakeLibraryOptionsApplied : Nat := ' >> "$PROJECT/TechDebtTest/OptionRequired.lean"
+for ((i = 0; i < 700; i++)); do printf 'Nat.succ (' >> "$PROJECT/TechDebtTest/OptionRequired.lean"; done
+printf '0' >> "$PROJECT/TechDebtTest/OptionRequired.lean"
+for ((i = 0; i < 700; i++)); do printf ')' >> "$PROJECT/TechDebtTest/OptionRequired.lean"; done
+printf '\n' >> "$PROJECT/TechDebtTest/OptionRequired.lean"
 cat > "$PROJECT/TechDebtTest/Markers.lean" <<'EOF'
 module
 import TechDebtTest.MarkerSupport
@@ -236,6 +261,13 @@ module
 
 set_option maxHeartbeats 300000
 
+EOF
+printf 'def lakeExecutableOptionsApplied : Nat := ' >> "$PROJECT/DebtRunner.lean"
+for ((i = 0; i < 700; i++)); do printf 'Nat.succ (' >> "$PROJECT/DebtRunner.lean"; done
+printf '0' >> "$PROJECT/DebtRunner.lean"
+for ((i = 0; i < 700; i++)); do printf ')' >> "$PROJECT/DebtRunner.lean"; done
+cat >> "$PROJECT/DebtRunner.lean" <<'EOF'
+
 public def main : IO Unit := pure ()
 EOF
 cat > "$PROJECT/Orphan.lean" <<'EOF'
@@ -245,6 +277,30 @@ module
 set_option maxHeartbeats 400000
 EOF
 (cd "$PROJECT" && lake build)
+
+printf 'test: tech-debt applies configured library and executable Lean options\n'
+if (cd "$PROJECT" && lake env lean -DmaxRecDepth=512 TechDebtTest/OptionRequired.lean \
+    > unconfigured-options.out 2>&1); then
+  echo 'deep option fixture unexpectedly elaborated with the default recursion depth' >&2
+  exit 1
+fi
+grep -q 'maximum recursion depth' "$PROJECT/unconfigured-options.out"
+(cd "$PROJECT" && lake exe aftk tech-debt --jsonl --markers maxHeartbeats \
+  module TechDebtTest.OptionRequired > configured-library-options.jsonl)
+[[ ! -s "$PROJECT/configured-library-options.jsonl" ]]
+(cd "$PROJECT" && lake exe aftk tech-debt --jsonl --markers maxHeartbeats \
+  module DebtRunner > configured-executable-options.jsonl)
+python3 - "$PROJECT/configured-executable-options.jsonl" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    findings = [json.loads(line) for line in stream if line.strip()]
+
+assert [(finding["module"], finding["kind"]) for finding in findings] == [
+    ("DebtRunner", "maxHeartbeats"),
+], findings
+PY
 
 printf 'test: tech-debt finds every supported marker\n'
 (cd "$PROJECT" && lake exe aftk tech-debt --jsonl --all-markers \
