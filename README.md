@@ -95,7 +95,7 @@ For large imports such as Mathlib, prefer using module filters with `rdeps`.
 
 ## Technical-debt detection
 
-`tech-debt` elaborates Lean modules, traverses their info trees, and reports configured technical-debt markers with 1-based source locations. Every invocation must select markers explicitly with `--markers` or `--all-markers`; there are no default or otherwise special markers.
+`tech-debt` elaborates Lean modules, traverses their info trees, and reports configured technical-debt markers with 1-based source locations. Every invocation must select findings explicitly with `--markers`, `--all-markers`, or `--option`; there are no default markers.
 
 ```bash
 lake exe aftk tech-debt --markers maxHeartbeats,erw module A.B.C
@@ -103,9 +103,12 @@ lake exe aftk tech-debt --all-markers library MyLibrary
 lake exe aftk tech-debt --markers sorry,axiom package my_package
 lake exe aftk tech-debt --markers deprecated                 # root package
 lake exe aftk tech-debt --markers simpNF A.B.C --jsonl       # module shorthand
+lake exe aftk tech-debt --option linter.style.* module A.B.C
 ```
 
-`--markers` accepts a comma-separated list and may be repeated. Supported marker names are `maxHeartbeats`, `maxRecDepth`, `unlockLimits`, `backwardOption`, `linterFlexible`, `linterOverlappingInstances`, `linterAuxLemma`, `linterDeprecated`, `simpVarHead`, `developmentOption`, `longFile`, `erw`, `simpInstances`, `dsimpInstances`, `adaptationNote`, `simpNF`, `exposePublic`, `finCommRing`, `finNatCast`, `sorry`, `deprecated`, and `axiom`. Run `lake exe aftk help tech-debt` for their descriptions.
+`--markers` accepts a comma-separated list and may be repeated. Supported marker names are `maxHeartbeats`, `maxRecDepth`, `maxSynthPendingDepth`, `unlockLimits`, `backwardOption`, `linterFlexible`, `linterOverlappingInstances`, `linterAuxLemma`, `linterDeprecated`, `linterUnused`, `autoImplicit`, `simpVarHead`, `developmentOption`, `longFile`, `erw`, `simpInstances`, `dsimpInstances`, `adaptationNote`, `simpNF`, `exposePublic`, `finCommRing`, `finNatCast`, `sorry`, `deprecated`, and `axiom`. Run `lake exe aftk help tech-debt` for their descriptions.
+
+`--option` may also be repeated. It accepts either an exact option name or a namespace ending in `.*`; for example, `--option linter.style.*` selects every `set_option` under `linter.style`. These findings use kind `option`. A matching override can produce both its built-in marker and `option` when both selections are requested.
 
 Library scans use Lake's `modules` facet, so they follow the library's configured roots and local
 imports. Package scans combine those facet results for every Lean library in the package and add
@@ -114,5 +117,7 @@ the root module of each configured Lean executable.
 The default output is tab-separated:
 
 ```text
-<file>:<line>:<column>\t<kind>\t<description>
+<file>:<line>:<column>\t<kind>\t<description>[\t<detail>]
 ```
+
+Every option-derived finding includes its reprinted name and value as `detail`. JSONL output also includes its syntactic `scope` (`command`, `term`, or `tactic`); non-option findings omit both fields.

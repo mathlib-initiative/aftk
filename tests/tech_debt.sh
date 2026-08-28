@@ -83,6 +83,7 @@ public register_option linter.flexible : Bool := { defValue := true, descr := "t
 public register_option linter.overlappingInstances : Bool := { defValue := true, descr := "test option" }
 public register_option linter.auxLemma : Bool := { defValue := true, descr := "test option" }
 public register_option linter.style.longFile : Nat := { defValue := 1000, descr := "test option" }
+public register_option linter.style.setOption : Bool := { defValue := true, descr := "test option" }
 public register_option techDebtTest.required : Bool := { defValue := false, descr := "test option" }
 
 open Lean
@@ -234,6 +235,28 @@ theorem multilineConvErwMarker (a b : Nat) (h : a = b) : a + 0 = b := by
     erw [Nat.add_zero]
   exact h
 
+set_option maxSynthPendingDepth 3 in
+def synthesisPendingDepthMarker : Nat := 1
+
+theorem unusedLinterMarker : True := by
+  set_option linter.unusedSectionVars false in
+    trivial
+
+def autoImplicitMarker : Nat := set_option autoImplicit true in 1
+
+set_option linter.unusedSimpArgs true in
+def enabledUnusedLinterIsNotMarker : Nat := 1
+
+def disabledAutoImplicitIsNotMarker : Nat := set_option autoImplicit false in 1
+
+def relaxedAutoImplicitMarker : Nat := set_option relaxedAutoImplicit true in 1
+
+theorem genericStyleTacticOption : True := by
+  set_option linter.style.setOption false in
+    trivial
+
+def genericStyleTermOption : Nat := set_option linter.style.longFile 3000 in 1
+
 -- Marker syntax inside quotations is data, not technical debt in this module.
 macro "quoted_axiom" : command => `(command| axiom quoted : True)
 macro "quoted_deprecated" : command => `(command| @[deprecated] def quoted : Nat := 0)
@@ -355,8 +378,106 @@ assert [(finding["range"]["start"]["line"], finding["kind"]) for finding in find
     (84, "erw"),
     (87, "erw"),
     (93, "erw"),
+    (96, "maxSynthPendingDepth"),
+    (100, "linterUnused"),
+    (103, "autoImplicit"),
+    (110, "autoImplicit"),
+    (116, "longFile"),
+], findings
+
+option_findings = [
+    finding for finding in findings
+    if finding["kind"] in {
+        "maxHeartbeats", "maxRecDepth", "maxSynthPendingDepth", "backwardOption",
+        "linterFlexible", "linterOverlappingInstances", "linterAuxLemma",
+        "linterDeprecated", "linterUnused", "autoImplicit", "simpVarHead",
+        "developmentOption", "longFile",
+    }
+]
+assert option_findings
+assert all("detail" in finding and "scope" in finding for finding in option_findings)
+assert all(
+    "detail" not in finding and "scope" not in finding
+    for finding in findings if finding not in option_findings
+)
+assert {
+    (finding["range"]["start"]["line"], finding["detail"], finding["scope"])
+    for finding in option_findings
+} >= {
+    (13, "backward.example false", "term"),
+    (31, "pp.universes true", "command"),
+    (96, "maxSynthPendingDepth 3", "command"),
+    (100, "linter.unusedSectionVars false", "tactic"),
+    (103, "autoImplicit true", "term"),
+    (110, "relaxedAutoImplicit true", "term"),
+}
+PY
+
+printf 'test: tech-debt selects arbitrary options by exact name or namespace\n'
+(cd "$PROJECT" && lake exe aftk tech-debt --jsonl --option linter.style.* \
+  module TechDebtTest.Markers > style-options.jsonl)
+python3 - "$PROJECT/style-options.jsonl" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    findings = [json.loads(line) for line in stream if line.strip()]
+
+assert [
+    (finding["range"]["start"]["line"], finding["kind"], finding["detail"], finding["scope"])
+    for finding in findings
+] == [
+    (34, "option", "linter.style.longFile 2000", "command"),
+    (113, "option", "linter.style.setOption false", "tactic"),
+    (116, "option", "linter.style.longFile 3000", "term"),
 ], findings
 PY
+
+(cd "$PROJECT" && lake exe aftk tech-debt --jsonl \
+  --option linter.style.setOption --option=linter.style.setOption \
+  module TechDebtTest.Markers > exact-option.jsonl)
+python3 - "$PROJECT/exact-option.jsonl" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    findings = [json.loads(line) for line in stream if line.strip()]
+
+assert [(finding["range"]["start"]["line"], finding["detail"]) for finding in findings] == [
+    (113, "linter.style.setOption false"),
+], findings
+PY
+
+(cd "$PROJECT" && lake exe aftk tech-debt --jsonl --markers longFile \
+  --option linter.style.longFile module TechDebtTest.Markers > built-in-and-option.jsonl)
+python3 - "$PROJECT/built-in-and-option.jsonl" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    findings = [json.loads(line) for line in stream if line.strip()]
+
+assert [(finding["range"]["start"]["line"], finding["kind"]) for finding in findings] == [
+    (34, "longFile"),
+    (34, "option"),
+    (116, "longFile"),
+    (116, "option"),
+], findings
+PY
+
+printf 'test: tech-debt validates option selectors\n'
+if (cd "$PROJECT" && lake exe aftk tech-debt --option= module TechDebtTest.Markers \
+    > empty-option.out 2> empty-option.err); then
+  echo 'tech-debt unexpectedly accepted an empty option selector' >&2
+  exit 1
+fi
+grep -q 'option selectors must not be empty' "$PROJECT/empty-option.err"
+if (cd "$PROJECT" && lake exe aftk tech-debt --option 'linter.*.invalid' \
+    module TechDebtTest.Markers > invalid-option.out 2> invalid-option.err); then
+  echo 'tech-debt unexpectedly accepted a misplaced option wildcard' >&2
+  exit 1
+fi
+grep -q 'invalid option selector' "$PROJECT/invalid-option.err"
 
 printf 'test: tech-debt finds tactic- and conv-mode core erw syntax\n'
 (cd "$PROJECT" && lake exe aftk tech-debt --jsonl --markers erw \
@@ -491,6 +612,17 @@ printf 'test: tech-debt compatibility syntax, default output, and help\n'
 [[ "$(wc -l < "$PROJECT/findings.tsv")" -eq 3 ]]
 grep -q $'Example.lean:4:1\tmaxHeartbeats\t' "$PROJECT/findings.tsv"
 grep -q $'Example.lean:8:3\terw\t' "$PROJECT/findings.tsv"
+python3 - "$PROJECT/findings.tsv" <<'PY'
+import sys
+
+with open(sys.argv[1]) as stream:
+    rows = [line.rstrip("\n").split("\t") for line in stream]
+
+assert [len(row) for row in rows] == [4, 3, 4], rows
+assert rows[0][3] == "maxHeartbeats 1000000", rows
+assert rows[2][3] == "maxHeartbeats 1000000", rows
+PY
 (cd "$PROJECT" && lake exe aftk help tech-debt) | grep -q 'Find technical debt'
+(cd "$PROJECT" && lake exe aftk help tech-debt) | grep -q -- '--option <name>'
 
 printf 'all tech-debt tests passed\n'

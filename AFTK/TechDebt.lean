@@ -21,6 +21,8 @@ inductive Kind where
   | maxHeartbeats
   /-- A command that overrides Lean's recursion-depth limit. -/
   | maxRecDepth
+  /-- A command that overrides Lean's synthesis pending-depth limit. -/
+  | maxSynthPendingDepth
   /-- A command that disables Lean's built-in resource limits. -/
   | unlockLimits
   /-- A Lean backwards-compatibility option override. -/
@@ -33,6 +35,10 @@ inductive Kind where
   | linterAuxLemma
   /-- A disabled deprecation linter. -/
   | linterDeprecated
+  /-- A disabled unused-code linter. -/
+  | linterUnused
+  /-- An option that enables automatically bound implicit variables. -/
+  | autoImplicit
   /-- A disabled simplifier variable-head warning. -/
   | simpVarHead
   /-- A development-only debug, pretty-printing, profiler, or trace option. -/
@@ -61,6 +67,8 @@ inductive Kind where
   | deprecated
   /-- An axiom declaration. -/
   | axiom
+  /-- A `set_option` override selected by its exact name or namespace. -/
+  | option
   deriving Inhabited, BEq
 
 namespace Kind
@@ -69,12 +77,15 @@ namespace Kind
 def name : Kind → String
   | .maxHeartbeats => "maxHeartbeats"
   | .maxRecDepth => "maxRecDepth"
+  | .maxSynthPendingDepth => "maxSynthPendingDepth"
   | .unlockLimits => "unlockLimits"
   | .backwardOption => "backwardOption"
   | .linterFlexible => "linterFlexible"
   | .linterOverlappingInstances => "linterOverlappingInstances"
   | .linterAuxLemma => "linterAuxLemma"
   | .linterDeprecated => "linterDeprecated"
+  | .linterUnused => "linterUnused"
+  | .autoImplicit => "autoImplicit"
   | .simpVarHead => "simpVarHead"
   | .developmentOption => "developmentOption"
   | .longFile => "longFile"
@@ -89,17 +100,21 @@ def name : Kind → String
   | .sorry => "sorry"
   | .deprecated => "deprecated"
   | .axiom => "axiom"
+  | .option => "option"
 
 /-- Human-readable description of a finding category. -/
 def description : Kind → String
   | .maxHeartbeats => "heartbeat limit override"
   | .maxRecDepth => "recursion-depth limit override"
+  | .maxSynthPendingDepth => "synthesis pending-depth override"
   | .unlockLimits => "`unlock_limits` command"
   | .backwardOption => "Lean backwards-compatibility option override"
   | .linterFlexible => "disabled `linter.flexible` check"
   | .linterOverlappingInstances => "disabled `linter.overlappingInstances` check"
   | .linterAuxLemma => "disabled `linter.auxLemma` check"
   | .linterDeprecated => "disabled deprecation lint"
+  | .linterUnused => "disabled unused-code linter"
+  | .autoImplicit => "auto-bound implicits enabled"
   | .simpVarHead => "disabled simplifier variable-head warning"
   | .developmentOption => "development-only option setting"
   | .longFile => "long-file limit override"
@@ -114,12 +129,14 @@ def description : Kind → String
   | .sorry => "unfinished proof or value placeholder"
   | .deprecated => "deprecated declaration or module"
   | .axiom => "axiom declaration"
+  | .option => "`set_option` override"
 
-/-- Every technical-debt marker understood by AFTK, in CLI display order. -/
+/-- Every built-in technical-debt marker understood by AFTK, in CLI display order. -/
 def all : Array Kind := #[
-  .maxHeartbeats, .maxRecDepth, .unlockLimits, .backwardOption,
+  .maxHeartbeats, .maxRecDepth, .maxSynthPendingDepth, .unlockLimits, .backwardOption,
   .linterFlexible, .linterOverlappingInstances, .linterAuxLemma, .linterDeprecated,
-  .simpVarHead, .developmentOption, .longFile, .erw, .simpInstances, .dsimpInstances,
+  .linterUnused, .autoImplicit, .simpVarHead, .developmentOption, .longFile,
+  .erw, .simpInstances, .dsimpInstances,
   .adaptationNote, .simpNF, .exposePublic, .finCommRing, .finNatCast, .sorry, .deprecated, .axiom]
 
 /-- Parse a stable marker name accepted by `--markers`. -/
@@ -132,6 +149,23 @@ def help : String :=
 
 end Kind
 
+/-- The syntactic position of a `set_option` override. -/
+inductive FindingScope where
+  | command
+  | term
+  | tactic
+  deriving Inhabited, BEq
+
+namespace FindingScope
+
+/-- Stable machine-readable name for an option finding's syntactic scope. -/
+def name : FindingScope → String
+  | .command => "command"
+  | .term => "term"
+  | .tactic => "tactic"
+
+end FindingScope
+
 /-- One technical-debt occurrence in a source module. Positions are 1-based. -/
 structure Finding where
   moduleName : Name
@@ -139,7 +173,43 @@ structure Finding where
   kind : Kind
   start : Position
   stop : Position
+  detail? : Option String := none
+  scope? : Option FindingScope := none
   deriving Inhabited
+
+/-- A command-line selector for option names. -/
+inductive OptionSelector where
+  /-- Match exactly one option name. -/
+  | exact (optionName : Name)
+  /-- Match an option-name namespace. -/
+  | prefix (optionPrefix : Name)
+  deriving Inhabited, BEq
+
+namespace OptionSelector
+
+/-- Parse an exact option name or a namespace ending in `.*`. -/
+def parse (raw : String) : Except String OptionSelector := do
+  let value := raw.trimAscii.toString
+  if value.isEmpty then
+    throw "option selectors must not be empty"
+  let nameString := if value.endsWith ".*" then (value.dropEnd 2).toString else value
+  if nameString.isEmpty || nameString.startsWith "." || nameString.endsWith "." ||
+      (nameString.splitOn ".").any (·.isEmpty) then
+    throw s!"invalid option selector `{value}`"
+  if nameString.any Char.isWhitespace then
+    throw s!"invalid option selector `{value}`"
+  if nameString.contains '*' then
+    throw s!"invalid option selector `{value}`; `*` is only supported as a final `.*`"
+  if value.endsWith ".*" then
+    return .prefix nameString.toName
+  return .exact nameString.toName
+
+/-- Test whether an option name is accepted by a selector. -/
+def accepts : OptionSelector → Name → Bool
+  | .exact expected, optionName => optionName == expected
+  | .prefix expectedPrefix, optionName => expectedPrefix.isPrefixOf optionName
+
+end OptionSelector
 
 /-- The configured scope of a technical-debt scan. -/
 inductive Scope where
@@ -155,6 +225,7 @@ inductive Scope where
 structure Config where
   scope : Scope
   markers : Array Kind
+  optionSelectors : Array OptionSelector := #[]
   jsonl : Bool := false
   deriving Inhabited
 
@@ -177,16 +248,17 @@ Scopes:
   <module>                  Compatibility shorthand for `module <module>`.
 
 Options:
-  --markers <list>   Required comma-separated marker names. May be repeated.
-  --all-markers      Select every supported marker.
-  --jsonl            Print one JSON object per finding instead of tab-separated rows.
-  -h, --help         Show this help.
+  --markers <list>  Comma-separated marker names. May be repeated.
+  --all-markers     Select every supported built-in marker.
+  --option <name>   Select an exact option name or a namespace ending in `.*`. May be repeated.
+  --jsonl           Print one JSON object per finding instead of tab-separated rows.
+  -h, --help        Show this help.
 
 Markers:
 " ++ Kind.help ++ "
 
 Output:
-  By default: <file>:<line>:<column>\t<kind>\t<description>.
+  By default: <file>:<line>:<column>\t<kind>\t<description>[\t<detail>].
   Positions are 1-based."
 
 /-- Interpret positional arguments as a scan scope. -/
@@ -223,31 +295,52 @@ def parseMarkers (value : String) : Except String (Array Kind) := do
     markers := markers.push marker
   return normalizeMarkers markers
 
+/-- Deduplicate option selectors while preserving their command-line order. -/
+def normalizeOptionSelectors (selectors : Array OptionSelector) : Array OptionSelector := Id.run do
+  let mut result := #[]
+  for selector in selectors do
+    unless result.contains selector do
+      result := result.push selector
+  return result
+
 /-- Parse `tech-debt` command arguments. `none` means help was requested. -/
 def parseArgs (args : List String) : Except String (Option Config) := do
   let rec go (args : List String) (jsonl : Bool) (markers? : Option (Array Kind))
-      (positionals : Array String) : Except String (Option Config) := do
+      (optionSelectors : Array OptionSelector) (positionals : Array String) :
+      Except String (Option Config) := do
     match args with
     | [] =>
-        let some markers := markers?
-          | throw "missing marker selection: use `--markers <list>` or `--all-markers`"
-        return some { scope := ← parseScope positionals, markers := normalizeMarkers markers, jsonl }
+        if markers?.isNone && optionSelectors.isEmpty then
+          throw "missing marker selection: use `--markers <list>`, `--all-markers`, or `--option <name>`"
+        return some {
+          scope := ← parseScope positionals
+          markers := normalizeMarkers (markers?.getD #[])
+          optionSelectors := normalizeOptionSelectors optionSelectors
+          jsonl
+        }
     | "--help" :: _ | "-h" :: _ => return none
-    | "--jsonl" :: rest => go rest true markers? positionals
-    | "--all-markers" :: rest => go rest jsonl (some Kind.all) positionals
+    | "--jsonl" :: rest => go rest true markers? optionSelectors positionals
+    | "--all-markers" :: rest => go rest jsonl (some Kind.all) optionSelectors positionals
     | "--markers" :: value :: rest =>
         let selected ← parseMarkers value
-        go rest jsonl (some (markers?.getD #[] ++ selected)) positionals
+        go rest jsonl (some (markers?.getD #[] ++ selected)) optionSelectors positionals
     | "--markers" :: [] => throw "missing value after `--markers`"
+    | "--option" :: value :: rest =>
+        let selector ← OptionSelector.parse value
+        go rest jsonl markers? (optionSelectors.push selector) positionals
+    | "--option" :: [] => throw "missing value after `--option`"
     | arg :: rest =>
         if arg.startsWith "--markers=" then
           let selected ← parseMarkers (arg.drop "--markers=".length).toString
-          go rest jsonl (some (markers?.getD #[] ++ selected)) positionals
+          go rest jsonl (some (markers?.getD #[] ++ selected)) optionSelectors positionals
+        else if arg.startsWith "--option=" then
+          let selector ← OptionSelector.parse (arg.drop "--option=".length).toString
+          go rest jsonl markers? (optionSelectors.push selector) positionals
         else if arg.startsWith "-" then
           throw s!"unknown option `{arg}`"
         else
-          go rest jsonl markers? (positionals.push arg)
-  go args false none #[]
+          go rest jsonl markers? optionSelectors (positionals.push arg)
+  go args false none #[] #[]
 
 /-- Load the Lake workspace rooted at the current project. -/
 def loadProjectWorkspace : IO Lake.Workspace := do
@@ -412,6 +505,10 @@ structure SetOptionSyntax where
   value : Syntax
   stx : Syntax
 
+/-- Reprinted option name and value for tracker-friendly output. -/
+def SetOptionSyntax.detail (option : SetOptionSyntax) : String :=
+  s!"{option.optionName} {option.value.reprint.getD "" |>.trimAscii}"
+
 /-- Parse a `set_option` syntax node, including a command wrapped in `... in`. -/
 partial def setOptionSyntax? (stx : Syntax) : Option SetOptionSyntax :=
   if (stx.isOfKind ``Lean.Parser.Command.set_option ||
@@ -432,10 +529,13 @@ partial def setOptionSyntax? (stx : Syntax) : Option SetOptionSyntax :=
 def setOptionKind? (option : SetOptionSyntax) : Option Kind :=
   let name := option.optionName
   let isFalse := syntaxContainsNameToken option.value `false
+  let isTrue := syntaxContainsNameToken option.value `true
   if name == `maxHeartbeats || name == `synthInstance.maxHeartbeats then
     some .maxHeartbeats
   else if name == `maxRecDepth then
     some .maxRecDepth
+  else if name == `maxSynthPendingDepth then
+    some .maxSynthPendingDepth
   else if name.getRoot == `backward then
     some .backwardOption
   else if name == `linter.flexible && isFalse then
@@ -446,6 +546,10 @@ def setOptionKind? (option : SetOptionSyntax) : Option Kind :=
     some .linterAuxLemma
   else if name == `linter.deprecated && isFalse then
     some .linterDeprecated
+  else if name.toString.startsWith "linter.unused" && isFalse then
+    some .linterUnused
+  else if (name == `autoImplicit || name == `relaxedAutoImplicit) && isTrue then
+    some .autoImplicit
   else if name == `warning.simp.varHead && isFalse then
     some .simpVarHead
   else if name.getRoot == `debug || name.getRoot == `pp ||
@@ -455,6 +559,32 @@ def setOptionKind? (option : SetOptionSyntax) : Option Kind :=
     some .longFile
   else
     none
+
+/-- A possible finding paired with the syntax and optional option metadata that produced it. -/
+structure SyntaxMarker where
+  kind : Kind
+  stx : Syntax
+  detail? : Option String := none
+  scope? : Option FindingScope := none
+
+/-- Construct a marker with no option-specific metadata. -/
+def syntaxMarker (kind : Kind) (stx : Syntax) : SyntaxMarker := { kind, stx }
+
+/-- Construct all selected built-in and generic markers for one `set_option`. -/
+def setOptionMarkers (option : SetOptionSyntax) (scope : FindingScope)
+    (selectors : Array OptionSelector) : Array SyntaxMarker := Id.run do
+  let mut markers := #[]
+  let detail := option.detail
+  if let some kind := setOptionKind? option then
+    markers := markers.push { kind, stx := option.stx, detail? := some detail, scope? := some scope }
+  if selectors.any (·.accepts option.optionName) then
+    markers := markers.push {
+      kind := .option
+      stx := option.stx
+      detail? := some detail
+      scope? := some scope
+    }
+  return markers
 
 /-- True when an attribute has the given name and contains the given argument. -/
 partial def hasAttributeWithArgument (stx : Syntax) (attrName argument : Name) : Bool :=
@@ -519,12 +649,6 @@ partial def enablesInstances (stx : Syntax) : Bool :=
   else
     stx.getArgs.any enablesInstances
 
-/-- Return the syntax introducing a command-level option, if present. -/
-def commandSetOption? (stx : Syntax) : Option (Kind × Syntax) := do
-  let option ← setOptionSyntax? stx
-  let kind ← setOptionKind? option
-  return (kind, option.stx)
-
 /-- Kinds of the core `erw` surface syntax: the tactic and `conv` forms. -/
 def coreErwKinds : Array SyntaxNodeKind :=
   #[``Lean.Parser.Tactic.tacticErw___, ``Lean.Parser.Tactic.Conv.convErw__]
@@ -537,107 +661,110 @@ def isCoreErwSyntax (stx : Syntax) : Bool :=
     | _ => false
 
 /-- Collect supported markers represented by a command info node. -/
-def commandMarkers (stx : Syntax) : Array (Kind × Syntax) := Id.run do
+def commandMarkers (stx : Syntax) (selectors : Array OptionSelector) : Array SyntaxMarker := Id.run do
   let mut markers := #[]
-  if let some marker := commandSetOption? stx then
-    markers := markers.push marker
+  if let some option := setOptionSyntax? stx then
+    markers := markers ++ setOptionMarkers option .command selectors
   let head := if stx.isOfKind ``Lean.Parser.Command.in && stx.getNumArgs > 0 then stx[0] else stx
   if head.isOfKind ``Lean.Parser.Command.unlock_limits then
-    markers := markers.push (.unlockLimits, head)
+    markers := markers.push (syntaxMarker .unlockLimits head)
   if startsWithAtom head "#adaptation_note" then
-    markers := markers.push (.adaptationNote, head)
+    markers := markers.push (syntaxMarker .adaptationNote head)
   if isExposedPublicSection head then
-    markers := markers.push (.exposePublic, head)
+    markers := markers.push (syntaxMarker .exposePublic head)
   if openCommandContainsNamespace head `Fin.CommRing then
-    markers := markers.push (.finCommRing, head)
+    markers := markers.push (syntaxMarker .finCommRing head)
   if openCommandContainsNamespace head `Fin.NatCast then
-    markers := markers.push (.finNatCast, head)
+    markers := markers.push (syntaxMarker .finNatCast head)
   if isDeclarationKind head ``Lean.Parser.Command.axiom then
-    markers := markers.push (.axiom, head)
+    markers := markers.push (syntaxMarker .axiom head)
   let commandAttributes? := commandAttributes? head
   if head.isOfKind ``Lean.Parser.Command.deprecated_module ||
       commandAttributes?.any (hasAttribute · `deprecated) then
-    markers := markers.push (.deprecated, head)
+    markers := markers.push (syntaxMarker .deprecated head)
   if commandAttributes?.any (hasAttributeWithArgument · `nolint `simpNF) then
-    markers := markers.push (.simpNF, head)
+    markers := markers.push (syntaxMarker .simpNF head)
   return markers
 
 /-- Collect supported markers represented by a tactic info node. -/
-def tacticMarkers (stx : Syntax) : Array (Kind × Syntax) := Id.run do
+def tacticMarkers (stx : Syntax) (selectors : Array OptionSelector) : Array SyntaxMarker := Id.run do
   let mut markers := #[]
   if let some option := setOptionSyntax? stx then
-    if let some kind := setOptionKind? option then
-      markers := markers.push (kind, option.stx)
+    markers := markers ++ setOptionMarkers option .tactic selectors
   if isCoreErwSyntax stx then
-    markers := markers.push (.erw, stx)
+    markers := markers.push (syntaxMarker .erw stx)
   if stx.isOfKind ``Lean.Parser.Tactic.simp && enablesInstances stx then
-    markers := markers.push (.simpInstances, stx)
+    markers := markers.push (syntaxMarker .simpInstances stx)
   if stx.isOfKind ``Lean.Parser.Tactic.dsimp && enablesInstances stx then
-    markers := markers.push (.dsimpInstances, stx)
+    markers := markers.push (syntaxMarker .dsimpInstances stx)
   if startsWithAtom stx "#adaptation_note" then
-    markers := markers.push (.adaptationNote, stx)
+    markers := markers.push (syntaxMarker .adaptationNote stx)
   if startsWithAtom stx "sorry" || startsWithAtom stx "admit" then
-    markers := markers.push (.sorry, stx)
+    markers := markers.push (syntaxMarker .sorry stx)
   return markers
 
 /-- Collect supported markers represented by a term info node. -/
-def termMarkers (stx : Syntax) : Array (Kind × Syntax) := Id.run do
+def termMarkers (stx : Syntax) (selectors : Array OptionSelector) : Array SyntaxMarker := Id.run do
   let mut markers := #[]
   if let some option := setOptionSyntax? stx then
-    if let some kind := setOptionKind? option then
-      markers := markers.push (kind, option.stx)
+    markers := markers ++ setOptionMarkers option .term selectors
   if stx.isOfKind ``Lean.Parser.Term.sorry then
-    markers := markers.push (.sorry, stx)
+    markers := markers.push (syntaxMarker .sorry stx)
   if startsWithAtom stx "#adaptation_note" then
-    markers := markers.push (.adaptationNote, stx)
+    markers := markers.push (syntaxMarker .adaptationNote stx)
   return markers
 
 /-- Build a finding from syntax that has a canonical source range. -/
 def findingOfSyntax? (moduleName : Name) (file : String) (fileMap : FileMap)
-    (kind : Kind) (stx : Syntax) : Option Finding := do
-  let range ← stx.getRange? (canonicalOnly := true)
+    (marker : SyntaxMarker) : Option Finding := do
+  let range ← marker.stx.getRange? (canonicalOnly := true)
   let start := fileMap.toPosition range.start
   let stop := fileMap.toPosition range.stop
   return {
     moduleName
     file
-    kind
+    kind := marker.kind
     start := { start with column := start.column + 1 }
     stop := { stop with column := stop.column + 1 }
+    detail? := marker.detail?
+    scope? := marker.scope?
   }
 
 /-- Add enabled syntax markers to a finding collection. -/
 def addSyntaxMarkers (moduleName : Name) (file : String) (fileMap : FileMap)
-    (enabledMarkers : Array Kind) (syntaxMarkers : Array (Kind × Syntax))
+    (enabledMarkers : Array Kind) (syntaxMarkers : Array SyntaxMarker)
     (findings : Array Finding) : Array Finding := Id.run do
   let mut findings := findings
-  for (kind, stx) in syntaxMarkers do
-    if enabledMarkers.contains kind then
-      if let some finding := findingOfSyntax? moduleName file fileMap kind stx then
+  for marker in syntaxMarkers do
+    if enabledMarkers.contains marker.kind || marker.kind == .option then
+      if let some finding := findingOfSyntax? moduleName file fileMap marker then
         findings := findings.push finding
   return findings
 
 /-- Collect findings from one info tree. -/
 partial def collectTree (moduleName : Name) (file : String) (fileMap : FileMap)
-    (enabledMarkers : Array Kind) (tree : InfoTree) (findings : Array Finding) : Array Finding :=
+    (enabledMarkers : Array Kind) (optionSelectors : Array OptionSelector)
+    (tree : InfoTree) (findings : Array Finding) : Array Finding :=
   match tree with
-  | .context _ tree => collectTree moduleName file fileMap enabledMarkers tree findings
+  | .context _ tree =>
+      collectTree moduleName file fileMap enabledMarkers optionSelectors tree findings
   | .hole _ => findings
   | .node info children =>
       let findings :=
         match info with
         | .ofCommandInfo commandInfo =>
             addSyntaxMarkers moduleName file fileMap enabledMarkers
-              (commandMarkers commandInfo.stx) findings
+              (commandMarkers commandInfo.stx optionSelectors) findings
         | .ofTacticInfo tacticInfo =>
             addSyntaxMarkers moduleName file fileMap enabledMarkers
-              (tacticMarkers tacticInfo.stx) findings
+              (tacticMarkers tacticInfo.stx optionSelectors) findings
         | .ofTermInfo termInfo =>
             addSyntaxMarkers moduleName file fileMap enabledMarkers
-              (termMarkers termInfo.stx) findings
+              (termMarkers termInfo.stx optionSelectors) findings
         | _ => findings
       children.foldl
-        (fun findings child => collectTree moduleName file fileMap enabledMarkers child findings) findings
+        (fun findings child =>
+          collectTree moduleName file fileMap enabledMarkers optionSelectors child findings) findings
 
 /-- True when two findings describe the same source occurrence. -/
 def Finding.sameOccurrence (a b : Finding) : Bool :=
@@ -662,13 +789,14 @@ def lessWithinModule (a b : Finding) : Bool :=
 
 /-- Find enabled technical debt in one module using an already loaded Lake workspace. -/
 def findModuleInWorkspace (workspace : Lake.Workspace) (moduleName : Name)
-    (enabledMarkers : Array Kind) : IO (Array Finding) := do
+    (enabledMarkers : Array Kind) (optionSelectors : Array OptionSelector := #[]) :
+    IO (Array Finding) := do
   let path ← resolveModuleSource moduleName
   let leanOptions := moduleLeanOptions workspace moduleName
   let (fileMap, trees) ← moduleInfoTreesWithOptions moduleName path leanOptions
   let mut findings := #[]
   for tree in trees do
-    findings := collectTree moduleName path.toString fileMap enabledMarkers tree findings
+    findings := collectTree moduleName path.toString fileMap enabledMarkers optionSelectors tree findings
   return (deduplicate findings).qsort lessWithinModule
 
 /-- Sort findings by module and source position for deterministic multi-module output. -/
@@ -680,11 +808,13 @@ def lessForOutput (a b : Finding) : Bool :=
 
 /-- Find enabled technical debt in modules using an already loaded Lake workspace. -/
 def findModulesInWorkspace (workspace : Lake.Workspace) (moduleNames : Array Name)
-    (enabledMarkers : Array Kind) : IO (Array Finding) := do
+    (enabledMarkers : Array Kind) (optionSelectors : Array OptionSelector := #[]) :
+    IO (Array Finding) := do
   addProjectLeanSearchPath
   let mut findings := #[]
   for moduleName in normalizeModuleNames moduleNames do
-    findings := findings ++ (← findModuleInWorkspace workspace moduleName enabledMarkers)
+    findings := findings ++
+      (← findModuleInWorkspace workspace moduleName enabledMarkers optionSelectors)
   return findings.qsort lessForOutput
 
 /-- Find enabled technical debt in one module. -/
@@ -704,11 +834,15 @@ def find (moduleName : Name) (enabledMarkers : Array Kind) : IO (Array Finding) 
 
 /-- Render a finding as a tab-separated row. -/
 def formatFinding (finding : Finding) : String :=
-  s!"{finding.file}:{finding.start.line}:{finding.start.column}\t{finding.kind.name}\t{finding.kind.description}"
+  let base :=
+    s!"{finding.file}:{finding.start.line}:{finding.start.column}\t{finding.kind.name}\t{finding.kind.description}"
+  match finding.detail? with
+  | some detail => s!"{base}\t{detail}"
+  | none => base
 
 /-- Render a finding as a compact JSON object. -/
 def formatFindingJsonLine (finding : Finding) : String :=
-  Json.compress <| Json.mkObj [
+  let fields : List (String × Json) := [
     ("module", toString finding.moduleName),
     ("file", finding.file),
     ("kind", finding.kind.name),
@@ -716,12 +850,20 @@ def formatFindingJsonLine (finding : Finding) : String :=
     ("range", Json.mkObj [
       ("start", Json.mkObj [("line", finding.start.line), ("column", finding.start.column)]),
       ("end", Json.mkObj [("line", finding.stop.line), ("column", finding.stop.column)])])]
+  let fields := match finding.detail? with
+    | some detail => fields ++ [("detail", Json.str detail)]
+    | none => fields
+  let fields := match finding.scope? with
+    | some scope => fields ++ [("scope", Json.str scope.name)]
+    | none => fields
+  Json.compress <| Json.mkObj fields
 
 /-- Run the `tech-debt` command. -/
 def run (config : Config) : IO Unit := do
   let workspace ← loadProjectWorkspace
   let moduleNames ← modulesForScope workspace config.scope
-  let findings ← findModulesInWorkspace workspace moduleNames config.markers
+  let findings ←
+    findModulesInWorkspace workspace moduleNames config.markers config.optionSelectors
   for finding in findings do
     if config.jsonl then
       IO.println (formatFindingJsonLine finding)
