@@ -14,6 +14,8 @@ jobs:
       - uses: leanprover/lean-action@v1
       - name: Process inventory tests
         run: lake env lean --run tests/process_inventory.lean
+      - name: Probe selection tests
+        run: lake env lean --run tests/probe_selection.lean
       - name: Dependency resolution tests
         run: ./tests/dependency.sh
       - name: Diagnostics daemon tests

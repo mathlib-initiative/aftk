@@ -19,7 +19,7 @@ open System
 open Std.Net
 
 /-- Current AFTK daemon protocol version. -/
-def protocolVersion : Nat := 4
+def protocolVersion : Nat := 5
 
 /-- Metadata persisted by a daemon in `.lake/aftk/server.json`. -/
 structure ServerMeta where
@@ -536,6 +536,69 @@ def parseRangeString (raw : String) : Except String (Nat × Nat × Nat × Nat) :
       let (endLine, endColumn) ← parseLineColumnString stop
       return (startLine, startColumn, endLine, endColumn)
   | _ => throw s!"invalid range `{raw}`; expected <line>:<column>-<line>:<column>"
+
+/-- Parse an inclusive 1-based `<start-line>:<end-line>` interval. -/
+def parseLineIntervalString (raw : String) : Except String (Nat × Nat) := do
+  match raw.splitOn ":" with
+  | [startLine, endLine] =>
+      return (← parsePositiveNat "start line" startLine, ← parsePositiveNat "end line" endLine)
+  | _ => throw s!"invalid line interval `{raw}`; expected <start-line>:<end-line>"
+
+/-- A probe range request. Source positions are 1-based until resolved against the daemon's
+synchronized in-memory baseline. -/
+inductive ProbeSelection where
+  | range (startLine startColumn endLine endColumn : Nat)
+  | at (line column : Nat)
+  | line (line : Nat)
+  | lines (startLine endLine : Nat)
+  | toEol (line column : Nat)
+  deriving Repr, BEq
+
+/-- Encode a high-level probe selection for the daemon protocol. -/
+def ProbeSelection.toJson (selection : ProbeSelection) : Json :=
+  match selection with
+  | .range startLine startColumn endLine endColumn => Json.mkObj [
+      ("kind", "range"), ("startLine", startLine), ("startColumn", startColumn),
+      ("endLine", endLine), ("endColumn", endColumn)]
+  | .at lineNo column =>
+      Json.mkObj [("kind", "at"), ("line", lineNo), ("column", column)]
+  | .line lineNo =>
+      Json.mkObj [("kind", "line"), ("line", lineNo)]
+  | .lines startLine endLine =>
+      Json.mkObj [("kind", "lines"), ("startLine", startLine), ("endLine", endLine)]
+  | .toEol lineNo column =>
+      Json.mkObj [("kind", "toEol"), ("line", lineNo), ("column", column)]
+
+/-- Decode a high-level probe selection from the daemon protocol. -/
+def probeSelectionFromJson (selection : Json) : Except String ProbeSelection := do
+  match ← getStringField selection "kind" with
+  | "range" =>
+      return .range (← getObjValAs? Nat selection "startLine")
+        (← getObjValAs? Nat selection "startColumn")
+        (← getObjValAs? Nat selection "endLine")
+        (← getObjValAs? Nat selection "endColumn")
+  | "at" =>
+      return .at (← getObjValAs? Nat selection "line")
+        (← getObjValAs? Nat selection "column")
+  | "line" =>
+      return .line (← getObjValAs? Nat selection "line")
+  | "lines" =>
+      return .lines (← getObjValAs? Nat selection "startLine")
+        (← getObjValAs? Nat selection "endLine")
+  | "toEol" =>
+      return .toEol (← getObjValAs? Nat selection "line")
+        (← getObjValAs? Nat selection "column")
+  | kind => throw s!"unknown probe selection kind `{kind}`"
+
+/-- Read a probe selection, accepting the concrete fields used by protocol version 4 clients. -/
+def probeSelectionFromParams (params : Json) : Except String ProbeSelection := do
+  if let some selection := (params.getObjVal? "selection").toOption then
+    probeSelectionFromJson selection
+  else
+    return .range (← getObjValAs? Nat params "startLine")
+      (← getObjValAs? Nat params "startColumn")
+      (← getObjValAs? Nat params "endLine")
+      (← getObjValAs? Nat params "endColumn")
 
 /-- Convert an LSP range to a 1-based agent-facing JSON object. -/
 def rangeJson1 (r : Range) : Json :=
@@ -1445,6 +1508,62 @@ def validateProbeRange (fileMap : FileMap) (range : Lsp.Range) : Except String U
   if endOffset < startOffset then
     throw "probe range end precedes its start"
 
+/-- Validate a 1-based logical line against a synchronized document. A trailing line terminator
+creates a final empty logical line, matching LSP's line model. -/
+def validateProbeLine (fileMap : FileMap) (line : Nat) : Except String Unit := do
+  if line == 0 then
+    throw "probe line must be >= 1"
+  if line > fileMap.getLastLine then
+    throw s!"probe line {line} is past end of file (last line is {fileMap.getLastLine})"
+
+/-- Return the LSP position just before a line's terminator, or EOF for the final logical line. -/
+def probeLineContentEnd (fileMap : FileMap) (line : Nat) : Lsp.Position :=
+  let endOffset :=
+    if line < fileMap.getLastLine then
+      fileMap.lineStart (line + 1) - '\n'
+    else
+      fileMap.source.rawEndPos
+  fileMap.utf8PosToLspPos endOffset
+
+/-- Resolve a high-level selection against the exact synchronized probe baseline. Whole-line
+forms preserve the final selected line's terminator. For a multi-line selection, separators
+inside the selected block are part of the replacement range. -/
+def resolveProbeSelection (fileMap : FileMap) (selection : ProbeSelection) : Except String Lsp.Range :=
+  let finish (range : Lsp.Range) : Except String Lsp.Range := do
+    validateProbeRange fileMap range
+    return range
+  match selection with
+  | .range startLine startColumn endLine endColumn => do
+      finish {
+        start := ← lspPositionFromLineColumn startLine startColumn
+        «end» := ← lspPositionFromLineColumn endLine endColumn
+      }
+  | .at lineNo column => do
+      let pos ← lspPositionFromLineColumn lineNo column
+      finish { start := pos, «end» := pos }
+  | .line lineNo => do
+      validateProbeLine fileMap lineNo
+      finish {
+        start := { line := lineNo - 1, character := 0 }
+        «end» := probeLineContentEnd fileMap lineNo
+      }
+  | .lines startLine endLine => do
+      validateProbeLine fileMap startLine
+      validateProbeLine fileMap endLine
+      if endLine < startLine then
+        throw s!"probe line interval is reversed: {startLine}:{endLine}"
+      finish {
+        start := { line := startLine - 1, character := 0 }
+        «end» := probeLineContentEnd fileMap endLine
+      }
+  | .toEol lineNo column => do
+      validateProbeLine fileMap lineNo
+      let start ← lspPositionFromLineColumn lineNo column
+      let lineEnd := probeLineContentEnd fileMap lineNo
+      unless validDocumentPosition fileMap start && start.character <= lineEnd.character do
+        throw s!"invalid --to-eol position {lineNo}:{column}; column must be a UTF-16 boundary within the line content"
+      finish { start, «end» := lineEnd }
+
 /-- Restore an open worker to the latest text on disk after a temporary probe. -/
 def Manager.restoreAfterProbe (m : Manager) (path : FilePath) (baseline : String)
     (baselineStamp? : Option ImportStamp) (timeoutMs : Nat) : IO Unit := do
@@ -1465,7 +1584,7 @@ def Manager.restoreAfterProbe (m : Manager) (path : FilePath) (baseline : String
   ofile.updateImportSnapshot m.projectRoot
 
 /-- Apply a candidate replacement in memory, inspect it, and restore the source from disk. -/
-def Manager.probeCore (m : Manager) (target : String) (replacementRange : Lsp.Range)
+def Manager.probeCore (m : Manager) (target : String) (selection : ProbeSelection)
     (replacement : String) (goalsAt? : Option Lsp.Position) (timeoutMs : Nat := 30000)
     (includeRaw : Bool := false) (refresh := false) (ttlMs? : Option Nat := none) : IO Json := do
   m.touch
@@ -1476,7 +1595,7 @@ def Manager.probeCore (m : Manager) (target : String) (replacementRange : Lsp.Ra
   let baseline ← ofile.lastTextRef.get
   let baselineStamp? ← importStamp? path
   let baselineMap := baseline.toFileMap
-  exceptToIO <| validateProbeRange baselineMap replacementRange
+  let replacementRange ← exceptToIO <| resolveProbeSelection baselineMap selection
   let candidate := (Lean.Server.replaceLspRange baselineMap replacementRange replacement).source
   try
     let candidateVersion ← ofile.sendFullTextChange candidate
@@ -1520,7 +1639,7 @@ def Manager.probeCore (m : Manager) (target : String) (replacementRange : Lsp.Ra
     m.restoreAfterProbe path baseline baselineStamp? timeoutMs
 
 /-- Run a serialized probe transaction and optionally release its worker afterwards. -/
-def Manager.probe (m : Manager) (target : String) (replacementRange : Lsp.Range)
+def Manager.probe (m : Manager) (target : String) (selection : ProbeSelection)
     (replacement : String) (goalsAt? : Option Lsp.Position) (timeoutMs : Nat := 30000)
     (includeRaw := false) (refresh := false) (closeAfter := false)
     (ttlMs? : Option Nat := none) : IO Json := do
@@ -1528,7 +1647,7 @@ def Manager.probe (m : Manager) (target : String) (replacementRange : Lsp.Range)
   let operationFile ← m.ensureOpen path.toString ttlMs?
   try
     operationFile.withOperation <|
-      m.probeCore target replacementRange replacement goalsAt? timeoutMs includeRaw refresh ttlMs?
+      m.probeCore target selection replacement goalsAt? timeoutMs includeRaw refresh ttlMs?
   finally
     if closeAfter then
       try
@@ -1675,14 +1794,7 @@ def Manager.handle (m : Manager) (req : Json) : IO Json := do
     | "probe" =>
         let target ← exceptToIO <| getStringField params "target"
         let replacement ← exceptToIO <| getStringField params "replacement"
-        let startLine ← exceptToIO <| getObjValAs? Nat params "startLine"
-        let startColumn ← exceptToIO <| getObjValAs? Nat params "startColumn"
-        let endLine ← exceptToIO <| getObjValAs? Nat params "endLine"
-        let endColumn ← exceptToIO <| getObjValAs? Nat params "endColumn"
-        let replacementRange : Lsp.Range := {
-          start := ← exceptToIO <| lspPositionFromLineColumn startLine startColumn
-          «end» := ← exceptToIO <| lspPositionFromLineColumn endLine endColumn
-        }
+        let selection ← exceptToIO <| probeSelectionFromParams params
         let goalsAt? ← exceptToIO <| match getNatField? params "goalLine", getNatField? params "goalColumn" with
           | none, none => .ok none
           | some line, some column => some <$> lspPositionFromLineColumn line column
@@ -1693,7 +1805,7 @@ def Manager.handle (m : Manager) (req : Json) : IO Json := do
         let closeAfter := (getBoolField? params "closeAfter" |>.getD false) ||
           (getBoolField? params "transient" |>.getD false)
         let ttlMs? := getNatField? params "ttlMs"
-        return okResponse (← m.probe target replacementRange replacement goalsAt? timeoutMs
+        return okResponse (← m.probe target selection replacement goalsAt? timeoutMs
           includeRaw refresh closeAfter ttlMs?)
     | "goals" =>
         let moduleName ← exceptToIO <| getStringField params "module"
@@ -2066,6 +2178,9 @@ Options:
 Probe options:
   --range <l:c-l:c>              Replace this 1-based, end-exclusive source range.
   --at <line:column>             Insert at a 1-based source position.
+  --line <line>                  Replace one line's content, preserving its terminator.
+  --lines <start:end>            Replace inclusive complete lines, preserving the final terminator.
+  --to-eol <line:column>         Replace from a UTF-16 position through the line's content.
   --stdin                        Read replacement text from standard input.
   --text <text>                  Use replacement text from one argument.
   --goals-at <line:column>       Also query tactic and term goals in the candidate.
@@ -2079,10 +2194,7 @@ def takeOptionValue (opt : String) : List String → Except String (String × Li
 /-- Parsed arguments for the `probe` command. Source positions remain 1-based here. -/
 structure ProbeCliConfig where
   target : String
-  startLine : Nat
-  startColumn : Nat
-  endLine : Nat
-  endColumn : Nat
+  selection : ProbeSelection
   goalsAt? : Option (Nat × Nat)
   replacement? : Option String
   readStdin : Bool
@@ -2094,72 +2206,114 @@ structure ProbeCliConfig where
 
 /-- Run the transactional in-memory probe CLI command. -/
 partial def runProbeCli (args : List String) : IO UInt32 := do
-  let finalize (target? : Option String) (range? : Option (Nat × Nat × Nat × Nat))
+  let finalize (target? : Option String) (selection? : Option ProbeSelection)
       (goalsAt? : Option (Nat × Nat)) (replacement? : Option String) (readStdin : Bool)
       (timeoutMs : Nat) (includeRaw refresh closeAfter : Bool) (ttlMs? : Option Nat)
       : Except String ProbeCliConfig := do
     let some target := target? | throw "probe requires <module-or-file>"
-    let some (startLine, startColumn, endLine, endColumn) := range?
-      | throw "probe requires --range <line:column-line:column> or --at <line:column>"
+    let some selection := selection?
+      | throw "probe requires exactly one of --range, --at, --line, --lines, or --to-eol"
     if readStdin && replacement?.isSome then
       throw "probe accepts exactly one of --stdin or --text"
     if !readStdin && replacement?.isNone then
       throw "probe requires replacement text via --stdin or --text"
     return {
-      target, startLine, startColumn, endLine, endColumn, goalsAt?, replacement?, readStdin,
+      target, selection, goalsAt?, replacement?, readStdin,
       timeoutMs, includeRaw, refresh, closeAfter, ttlMs?
     }
+  let setSelection (current : Option ProbeSelection) (next : ProbeSelection) : Except String (Option ProbeSelection) := do
+    if current.isSome then
+      throw "probe range selectors are mutually exclusive; choose exactly one of --range, --at, --line, --lines, or --to-eol"
+    return some next
   let rec parse (args : List String) (target? : Option String)
-      (range? : Option (Nat × Nat × Nat × Nat)) (goalsAt? : Option (Nat × Nat))
+      (selection? : Option ProbeSelection) (goalsAt? : Option (Nat × Nat))
       (replacement? : Option String) (readStdin : Bool) (timeoutMs : Nat)
       (includeRaw refresh closeAfter : Bool) (ttlMs? : Option Nat)
       : Except String ProbeCliConfig := do
     match args with
     | [] =>
-        finalize target? range? goalsAt? replacement? readStdin timeoutMs
+        finalize target? selection? goalsAt? replacement? readStdin timeoutMs
           includeRaw refresh closeAfter ttlMs?
     | "--range" :: rest =>
         let (value, rest) ← takeOptionValue "--range" rest
-        parse rest target? (some (← parseRangeString value)) goalsAt? replacement? readStdin
+        let (startLine, startColumn, endLine, endColumn) ← parseRangeString value
+        let selection? ← setSelection selection? (.range startLine startColumn endLine endColumn)
+        parse rest target? selection? goalsAt? replacement? readStdin
           timeoutMs includeRaw refresh closeAfter ttlMs?
     | "--at" :: rest =>
         let (value, rest) ← takeOptionValue "--at" rest
         let (line, column) ← parseLineColumnString value
-        parse rest target? (some (line, column, line, column)) goalsAt? replacement? readStdin
+        let selection? ← setSelection selection? (.at line column)
+        parse rest target? selection? goalsAt? replacement? readStdin
+          timeoutMs includeRaw refresh closeAfter ttlMs?
+    | "--line" :: rest =>
+        let (value, rest) ← takeOptionValue "--line" rest
+        let selection? ← setSelection selection? (.line (← parsePositiveNat "line" value))
+        parse rest target? selection? goalsAt? replacement? readStdin
+          timeoutMs includeRaw refresh closeAfter ttlMs?
+    | "--lines" :: rest =>
+        let (value, rest) ← takeOptionValue "--lines" rest
+        let (startLine, endLine) ← parseLineIntervalString value
+        let selection? ← setSelection selection? (.lines startLine endLine)
+        parse rest target? selection? goalsAt? replacement? readStdin
+          timeoutMs includeRaw refresh closeAfter ttlMs?
+    | "--to-eol" :: rest =>
+        let (value, rest) ← takeOptionValue "--to-eol" rest
+        let (line, column) ← parseLineColumnString value
+        let selection? ← setSelection selection? (.toEol line column)
+        parse rest target? selection? goalsAt? replacement? readStdin
           timeoutMs includeRaw refresh closeAfter ttlMs?
     | "--goals-at" :: rest =>
         let (value, rest) ← takeOptionValue "--goals-at" rest
-        parse rest target? range? (some (← parseLineColumnString value)) replacement? readStdin
+        parse rest target? selection? (some (← parseLineColumnString value)) replacement? readStdin
           timeoutMs includeRaw refresh closeAfter ttlMs?
     | "--stdin" :: rest =>
-        parse rest target? range? goalsAt? replacement? true timeoutMs includeRaw refresh closeAfter ttlMs?
+        parse rest target? selection? goalsAt? replacement? true timeoutMs includeRaw refresh closeAfter ttlMs?
     | "--text" :: rest =>
         let (value, rest) ← takeOptionValue "--text" rest
-        parse rest target? range? goalsAt? (some value) readStdin timeoutMs includeRaw refresh closeAfter ttlMs?
+        parse rest target? selection? goalsAt? (some value) readStdin timeoutMs includeRaw refresh closeAfter ttlMs?
     | "--timeout-ms" :: rest =>
         let (value, rest) ← takeOptionValue "--timeout-ms" rest
         let some n := value.toNat? | throw s!"invalid timeout `{value}`"
-        parse rest target? range? goalsAt? replacement? readStdin n includeRaw refresh closeAfter ttlMs?
+        parse rest target? selection? goalsAt? replacement? readStdin n includeRaw refresh closeAfter ttlMs?
     | "--raw-lsp" :: rest =>
-        parse rest target? range? goalsAt? replacement? readStdin timeoutMs true refresh closeAfter ttlMs?
+        parse rest target? selection? goalsAt? replacement? readStdin timeoutMs true refresh closeAfter ttlMs?
     | "--refresh" :: rest =>
-        parse rest target? range? goalsAt? replacement? readStdin timeoutMs includeRaw true closeAfter ttlMs?
+        parse rest target? selection? goalsAt? replacement? readStdin timeoutMs includeRaw true closeAfter ttlMs?
     | "--transient" :: rest | "--close-after" :: rest =>
-        parse rest target? range? goalsAt? replacement? readStdin timeoutMs includeRaw refresh true ttlMs?
+        parse rest target? selection? goalsAt? replacement? readStdin timeoutMs includeRaw refresh true ttlMs?
     | "--ttl-ms" :: rest =>
         let (value, rest) ← takeOptionValue "--ttl-ms" rest
         let some n := value.toNat? | throw s!"invalid ttl `{value}`"
-        parse rest target? range? goalsAt? replacement? readStdin timeoutMs includeRaw refresh closeAfter (some n)
+        parse rest target? selection? goalsAt? replacement? readStdin timeoutMs includeRaw refresh closeAfter (some n)
     | arg :: rest =>
         if arg.startsWith "--range=" then
-          parse rest target? (some (← parseRangeString (arg.drop "--range=".length).toString))
-            goalsAt? replacement? readStdin timeoutMs includeRaw refresh closeAfter ttlMs?
+          let (startLine, startColumn, endLine, endColumn) ←
+            parseRangeString (arg.drop "--range=".length).toString
+          let selection? ← setSelection selection? (.range startLine startColumn endLine endColumn)
+          parse rest target? selection? goalsAt? replacement? readStdin timeoutMs includeRaw refresh closeAfter ttlMs?
         else if arg.startsWith "--at=" then
           let (line, column) ← parseLineColumnString (arg.drop "--at=".length).toString
-          parse rest target? (some (line, column, line, column)) goalsAt? replacement? readStdin
+          let selection? ← setSelection selection? (.at line column)
+          parse rest target? selection? goalsAt? replacement? readStdin
+            timeoutMs includeRaw refresh closeAfter ttlMs?
+        else if arg.startsWith "--line=" then
+          let line ← parsePositiveNat "line" (arg.drop "--line=".length).toString
+          let selection? ← setSelection selection? (.line line)
+          parse rest target? selection? goalsAt? replacement? readStdin
+            timeoutMs includeRaw refresh closeAfter ttlMs?
+        else if arg.startsWith "--lines=" then
+          let (startLine, endLine) ← parseLineIntervalString (arg.drop "--lines=".length).toString
+          let selection? ← setSelection selection? (.lines startLine endLine)
+          parse rest target? selection? goalsAt? replacement? readStdin
+            timeoutMs includeRaw refresh closeAfter ttlMs?
+        else if arg.startsWith "--to-eol=" then
+          let (line, column) ← parseLineColumnString (arg.drop "--to-eol=".length).toString
+          let selection? ← setSelection selection? (.toEol line column)
+          parse rest target? selection? goalsAt? replacement? readStdin
             timeoutMs includeRaw refresh closeAfter ttlMs?
         else if arg.startsWith "--goals-at=" then
-          parse rest target? range? (some (← parseLineColumnString
+          parse rest target? selection? (some (← parseLineColumnString
             (arg.drop "--goals-at=".length).toString)) replacement? readStdin timeoutMs
             includeRaw refresh closeAfter ttlMs?
         else if arg.startsWith "-" then
@@ -2167,7 +2321,7 @@ partial def runProbeCli (args : List String) : IO UInt32 := do
         else if target?.isSome then
           throw s!"too many positional arguments: `{arg}`"
         else
-          parse rest (some arg) range? goalsAt? replacement? readStdin timeoutMs
+          parse rest (some arg) selection? goalsAt? replacement? readStdin timeoutMs
             includeRaw refresh closeAfter ttlMs?
   match parse args none none none none false 30000 false false false none with
   | .error e => IO.eprintln s!"error: {e}\n\n{cliHelp}"; return 1
@@ -2181,10 +2335,7 @@ partial def runProbeCli (args : List String) : IO UInt32 := do
       let mut fields : List (String × Json) := [
         ("target", config.target),
         ("replacement", replacement),
-        ("startLine", config.startLine),
-        ("startColumn", config.startColumn),
-        ("endLine", config.endLine),
-        ("endColumn", config.endColumn),
+        ("selection", config.selection.toJson),
         ("timeoutMs", config.timeoutMs),
         ("includeRawLsp", config.includeRaw),
         ("refresh", config.refresh),

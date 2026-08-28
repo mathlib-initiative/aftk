@@ -109,12 +109,24 @@ lake exe aftk open --ttl-ms 600000 A/B/C.lean
 
 `goals` uses the same daemon/worker lifecycle and returns both Lean LSP plain tactic goals (`tacticGoals`) and plain term goals (`termGoal`) at a 1-based line/column in the given module.
 
-`probe` temporarily replaces an end-exclusive, 1-based source range in the worker's in-memory document, waits for Lean diagnostics, optionally queries goals, and restores the current file from disk before returning. Replacement text can be passed safely through standard input:
+`probe` temporarily replaces source text in the worker's in-memory document, waits for Lean diagnostics, optionally queries goals, and restores the current file from disk before returning. Replacement text can be passed safely through standard input. Explicit `--range` endpoints and `--to-eol` positions are 1-based and use LSP UTF-16 columns:
 
 ```bash
 printf 'by\n  assumption' | lake exe aftk probe A.B.C \
   --range 42:15-44:8 --stdin --goals-at 43:3
+
+printf '  exact h' | lake exe aftk probe A.B.C --line 61 --stdin
+printf '  exact fun x => x' | lake exe aftk probe A.B.C --lines 61:63 --stdin
+printf 'simp' | lake exe aftk probe A.B.C --to-eol 61:3 --stdin
 ```
+
+`--line N` replaces that line's content without requiring its UTF-16 length and preserves its
+line terminator. `--lines A:B` replaces lines `A` through `B` inclusive: separators inside the
+block are replaced, while line `B`'s terminator is preserved. `--to-eol L:C` replaces from that
+UTF-16 boundary through the line content and also preserves the terminator. These selectors are
+mutually exclusive with one another and with `--range`/`--at`. A trailing terminator creates a
+selectable final empty logical line. CRLF is normalized to LF inside the Lean worker, while the
+on-disk file remains byte-for-byte untouched.
 
 The JSON result contains `accepted`, candidate diagnostics, optional tactic/term goals, and `restored`. `accepted` means that Lean produced no error diagnostics; it is independent of the outer daemon-protocol `ok` field. Probes never write the replacement to disk, and requests for the same file are serialized so diagnostics and goal queries cannot observe a temporary candidate.
 

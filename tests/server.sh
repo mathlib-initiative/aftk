@@ -165,6 +165,9 @@ assert_json "$p/goals-status.json" 'assert data["ok"]; assert data["result"]["op
 
 printf 'test: probe elaborates temporary replacements and restores the file\n'
 "$AFTK_BIN" probe --help | grep -q -- '--goals-at <line:column>'
+"$AFTK_BIN" probe --help | grep -q -- '--line <line>'
+"$AFTK_BIN" probe --help | grep -q -- '--lines <start:end>'
+"$AFTK_BIN" probe --help | grep -q -- '--to-eol <line:column>'
 p=$(make_project)
 cat > "$p/Tmp/Probe.lean" <<'EOF'
 module
@@ -249,6 +252,133 @@ cmp "$p/probe-baseline.lean" "$p/Tmp/Probe.lean"
 (cd "$p" && "$AFTK_BIN" status > probe-status.json)
 assert_json "$p/probe-transient.json" 'assert data["ok"]; assert data["result"]["accepted"] is True'
 assert_json "$p/probe-status.json" 'assert data["ok"]; assert data["result"]["openFileCount"] == 0'
+(cd "$p" && "$AFTK_BIN" shutdown >/dev/null)
+
+printf 'test: probe resolves line selectors against synchronized UTF-16 text\n'
+p=$(make_project)
+printf 'module\n\ntheorem selectorTarget (p q : Prop) (hp : p) : q → p := by\n  intro hq\n  exact hp\n-- symbols: 𝟙𝓝𝕜\n-- 𝟙 replace-me' > "$p/Tmp/Selector.lean"
+cp "$p/Tmp/Selector.lean" "$p/selector-baseline.lean"
+(cd "$p" && printf '  assumption' | "$AFTK_BIN" probe Tmp.Selector \
+  --line 5 --stdin --timeout-ms 20000 > selector-line-good.json)
+cmp "$p/selector-baseline.lean" "$p/Tmp/Selector.lean"
+(cd "$p" && "$AFTK_BIN" probe Tmp.Selector --line=5 --text '  exact hq' \
+  --timeout-ms 20000 > selector-line-bad.json)
+cmp "$p/selector-baseline.lean" "$p/Tmp/Selector.lean"
+(cd "$p" && "$AFTK_BIN" probe Tmp.Selector --line 1 --text 'module' \
+  --timeout-ms 20000 > selector-first.json)
+cmp "$p/selector-baseline.lean" "$p/Tmp/Selector.lean"
+(cd "$p" && "$AFTK_BIN" probe Tmp.Selector --line 2 --text '-- temporary empty line' \
+  --timeout-ms 20000 > selector-empty.json)
+cmp "$p/selector-baseline.lean" "$p/Tmp/Selector.lean"
+(cd "$p" && "$AFTK_BIN" probe Tmp.Selector --line 6 --text '-- replacement' \
+  --timeout-ms 20000 > selector-unicode.json)
+cmp "$p/selector-baseline.lean" "$p/Tmp/Selector.lean"
+(cd "$p" && "$AFTK_BIN" probe Tmp.Selector --line 7 --text '-- final' \
+  --timeout-ms 20000 > selector-final.json)
+cmp "$p/selector-baseline.lean" "$p/Tmp/Selector.lean"
+(cd "$p" && "$AFTK_BIN" probe Tmp.Selector --lines 4:5 --text '  exact fun _ => hp' \
+  --timeout-ms 20000 > selector-lines.json)
+cmp "$p/selector-baseline.lean" "$p/Tmp/Selector.lean"
+(cd "$p" && "$AFTK_BIN" probe Tmp.Selector --to-eol=7:7 --text 'kept' \
+  --timeout-ms 20000 > selector-to-eol.json)
+cmp "$p/selector-baseline.lean" "$p/Tmp/Selector.lean"
+assert_json "$p/selector-line-good.json" '
+assert data["ok"]
+r = data["result"]
+assert r["accepted"] is True
+assert r["replacementRange"] == {
+    "start": {"line": 5, "column": 1},
+    "end": {"line": 5, "column": 11},
+}
+'
+assert_json "$p/selector-line-bad.json" '
+assert data["ok"]
+assert data["result"]["accepted"] is False
+assert any(d["severity"] == "error" for d in data["result"]["diagnostics"])
+'
+assert_json "$p/selector-first.json" '
+assert data["ok"] and data["result"]["accepted"] is True
+assert data["result"]["replacementRange"] == {
+    "start": {"line": 1, "column": 1}, "end": {"line": 1, "column": 7}}
+'
+assert_json "$p/selector-empty.json" '
+assert data["ok"] and data["result"]["accepted"] is True
+assert data["result"]["replacementRange"] == {
+    "start": {"line": 2, "column": 1}, "end": {"line": 2, "column": 1}}
+'
+assert_json "$p/selector-unicode.json" '
+assert data["ok"] and data["result"]["accepted"] is True
+assert data["result"]["replacementRange"] == {
+    "start": {"line": 6, "column": 1}, "end": {"line": 6, "column": 19}}
+'
+assert_json "$p/selector-final.json" '
+assert data["ok"] and data["result"]["accepted"] is True
+assert data["result"]["replacementRange"] == {
+    "start": {"line": 7, "column": 1}, "end": {"line": 7, "column": 17}}
+'
+assert_json "$p/selector-lines.json" '
+assert data["ok"] and data["result"]["accepted"] is True
+assert data["result"]["replacementRange"] == {
+    "start": {"line": 4, "column": 1}, "end": {"line": 5, "column": 11}}
+'
+assert_json "$p/selector-to-eol.json" '
+assert data["ok"] and data["result"]["accepted"] is True
+assert data["result"]["replacementRange"] == {
+    "start": {"line": 7, "column": 7}, "end": {"line": 7, "column": 17}}
+'
+
+printf 'test: probe line selectors validate boundaries and conflicts\n'
+if (cd "$p" && "$AFTK_BIN" probe Tmp.Selector --line 0 --text module \
+    > selector-zero.json 2> selector-zero.err); then
+  echo 'probe unexpectedly accepted line zero' >&2
+  exit 1
+fi
+grep -q 'line must be >= 1' "$p/selector-zero.err"
+if (cd "$p" && "$AFTK_BIN" probe Tmp.Selector --line 99 --text module \
+    > selector-past.json); then
+  echo 'probe unexpectedly accepted a line past EOF' >&2
+  exit 1
+fi
+assert_json "$p/selector-past.json" 'assert not data["ok"]; assert "past end of file" in data["error"]["message"]'
+if (cd "$p" && "$AFTK_BIN" probe Tmp.Selector --lines 5:4 --text module \
+    > selector-reversed.json); then
+  echo 'probe unexpectedly accepted a reversed line interval' >&2
+  exit 1
+fi
+assert_json "$p/selector-reversed.json" 'assert not data["ok"]; assert "reversed" in data["error"]["message"]'
+if (cd "$p" && "$AFTK_BIN" probe Tmp.Selector --to-eol 7:5 --text kept \
+    > selector-half-surrogate.json); then
+  echo 'probe unexpectedly accepted half of a UTF-16 surrogate pair' >&2
+  exit 1
+fi
+assert_json "$p/selector-half-surrogate.json" 'assert not data["ok"]; assert "UTF-16 boundary" in data["error"]["message"]'
+if (cd "$p" && "$AFTK_BIN" probe Tmp.Selector --to-eol 7:99 --text kept \
+    > selector-column-past.json); then
+  echo 'probe unexpectedly accepted a column past line content' >&2
+  exit 1
+fi
+assert_json "$p/selector-column-past.json" 'assert not data["ok"]; assert "UTF-16 boundary" in data["error"]["message"]'
+if (cd "$p" && "$AFTK_BIN" probe Tmp.Selector --line 5 --range 5:1-5:11 --text module \
+    > selector-conflict.json 2> selector-conflict.err); then
+  echo 'probe unexpectedly accepted conflicting selectors' >&2
+  exit 1
+fi
+grep -q 'selectors are mutually exclusive' "$p/selector-conflict.err"
+cmp "$p/selector-baseline.lean" "$p/Tmp/Selector.lean"
+(cd "$p" && "$AFTK_BIN" shutdown >/dev/null)
+
+printf 'test: probe line selection preserves CRLF files byte-for-byte\n'
+p=$(make_project)
+printf 'module\r\n\r\ndef crlfValue : Nat :=\r\n  1\r\n' > "$p/Tmp/Crlf.lean"
+cp "$p/Tmp/Crlf.lean" "$p/crlf-baseline.lean"
+(cd "$p" && "$AFTK_BIN" probe Tmp.Crlf --line 4 --text '  2' \
+  --timeout-ms 20000 > selector-crlf.json)
+cmp "$p/crlf-baseline.lean" "$p/Tmp/Crlf.lean"
+assert_json "$p/selector-crlf.json" '
+assert data["ok"] and data["result"]["accepted"] is True
+assert data["result"]["replacementRange"] == {
+    "start": {"line": 4, "column": 1}, "end": {"line": 4, "column": 4}}
+'
 (cd "$p" && "$AFTK_BIN" shutdown >/dev/null)
 
 printf 'test: goals resolves custom srcDir modules without inherited LEAN_SRC_PATH\n'
@@ -441,7 +571,7 @@ import json, os, sys
 root, pid = sys.argv[1], int(sys.argv[2])
 with open(os.path.join(root, '.lake/aftk/server.json'), 'w') as f:
   json.dump({
-    'protocolVersion': 4, 'projectRoot': root, 'pid': pid, 'host': '127.0.0.1',
+    'protocolVersion': 5, 'projectRoot': root, 'pid': pid, 'host': '127.0.0.1',
     'port': 1, 'token': 'stale', 'startedAtMs': 0, 'lastSeenMs': 0, 'toolchain': ''
   }, f)
 PY
