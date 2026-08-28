@@ -14,6 +14,9 @@ Then run AFTK through that project's Lake environment. This gives AFTK the proje
 ```bash
 lake exe aftk deps [options] <module> <declaration>
 lake exe aftk rdeps [options] <module> <declaration>
+lake exe aftk rdeps [options] library <library> <declaration>
+lake exe aftk rdeps [options] package <package> <declaration>
+lake exe aftk rdeps [options] library <library> --stdin --jsonl
 lake exe aftk tech-debt [options] [module <module>|library <library>|package [<package>]]
 
 lake exe aftk diagnostics [options] <file>
@@ -64,6 +67,32 @@ Failed exact lookups also suggest up to 20 candidates without selecting one.
 JSONL result rows preserve `module` and `declaration` and add `definingModule`, `scopeModule`, and
 a structured `target`. Lookup failures are emitted as a JSONL `error` record with a stable code,
 the requested target, candidate count, truncation flag, and structured candidates.
+
+Explicit query scopes remove the need for an umbrella source module. `module` imports one module;
+`library` imports the modules returned by that Lake library's `modules` facet; and `package` imports
+all library modules and executable roots configured for the package. This follows custom `roots`
+and `srcDir` settings. Use `package . <declaration>` for a single query against the root package:
+
+```bash
+lake exe aftk rdeps module My.Module Namespace.target --jsonl
+lake exe aftk rdeps library MyLibrary Namespace.target --jsonl
+lake exe aftk rdeps package MyPackage Namespace.target --jsonl
+lake exe aftk rdeps package . Namespace.target --jsonl
+```
+
+For many targets, `--stdin --jsonl` accepts one nonempty declaration name per line. The selected
+environment is imported once, and declaration lookup and the reverse-dependency graph are reused:
+
+```bash
+printf '%s\n' Namespace.first "Namespace.name'" Namespace.missing | \
+  lake exe aftk rdeps library MyLibrary --stdin --jsonl
+```
+
+Each output line is one complete query record with its input, exact scope/import roots, resolved
+target, results, counts, and a `status` of `ok`, `leaf`, `unresolved`, or `error`. Input ordering and
+result ordering are deterministic. Any unresolved/error query makes the command fail after all
+records are emitted; `--allow-partial` opts into a successful exit for partial batches. Empty output
+is therefore never used to represent a leaf in scoped JSONL mode.
 
 ## File diagnostics daemon
 

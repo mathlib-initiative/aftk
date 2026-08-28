@@ -88,6 +88,12 @@ def accepts : ModulePattern → Name → Bool
   | .exact expected, moduleName => moduleName == expected
   | .prefix modulePrefix, moduleName => modulePrefix.isPrefixOf moduleName
 
+/-- Canonical spelling used to preserve output-filter context in structured query results. -/
+def format : ModulePattern → String
+  | .all => "*"
+  | .exact moduleName => s!"{moduleName}"
+  | .prefix modulePrefix => s!"{modulePrefix}.*"
+
 end ModulePattern
 
 /-- Output filter for module restrictions.  An empty pattern list means no restriction. -/
@@ -103,16 +109,52 @@ def accepts (filter : ModuleFilter) (moduleName : Name) : Bool :=
 
 end ModuleFilter
 
+/-- Modules loaded to answer a dependency query. -/
+inductive QueryScope where
+  /-- Import one Lean module. -/
+  | module (moduleName : Name)
+  /-- Import every module configured for one Lake library. -/
+  | library (libraryName : Name)
+  /-- Import every Lean target in a Lake package; `none` selects the root package. -/
+  | package (packageName? : Option Name)
+  deriving Inhabited, BEq
+
+namespace QueryScope
+
+/-- The module used by legacy private-name lookup, when the scope has exactly one named module. -/
+def resolutionModule : QueryScope → Name
+  | .module moduleName => moduleName
+  | .library _ | .package _ => Name.anonymous
+
+/-- A short scope kind for structured output. -/
+def kind : QueryScope → String
+  | .module _ => "module"
+  | .library _ => "library"
+  | .package _ => "package"
+
+/-- The configured scope name, if any. -/
+def name? : QueryScope → Option Name
+  | .module moduleName => some moduleName
+  | .library libraryName => some libraryName
+  | .package packageName? => packageName?
+
+end QueryScope
+
 /-- Parsed options and positional arguments for a query command. -/
 structure QueryConfig where
-  moduleString : String
-  declString : String
-  /-- Module that defined the target, independent of the module imported as the query scope. -/
+  scope : QueryScope
+  /-- A single command-line target; absent when targets are read from standard input. -/
+  declString? : Option String
+  /-- Module that defined the target, independent of the modules imported as the query scope. -/
   definedIn? : Option String := none
   /-- Resolve the declaration argument as a component-wise suffix instead of an exact name. -/
   resolveSuffix : Bool := false
   filter : ModuleFilter := {}
   jsonl : Bool := false
+  stdin : Bool := false
+  allowPartial : Bool := false
+  /-- Preserve the historical row-per-result JSONL format for `<module> <declaration>`. -/
+  legacySyntax : Bool := false
   deriving Inhabited
 
 /-- Parse a comma-separated list of module patterns. -/
@@ -130,32 +172,75 @@ def addPatternList (patterns : Array ModulePattern) (raw : String) : Except Stri
 def isModuleFilterOption (arg : String) : Bool :=
   arg == "--module" || arg == "-m" || arg == "--in" || arg == "--only-module" || arg == "--modules"
 
+/-- Interpret positional query arguments without changing the legacy two-positional form. -/
+def queryConfigFromPositionals
+    (positionals : Array String) (patterns : Array ModulePattern) (definedIn? : Option String)
+    (resolveSuffix jsonl stdin allowPartial : Bool) : Except String QueryConfig := do
+  let (scope, declString?, legacySyntax) ←
+    if stdin then
+      match positionals.toList with
+      | ["module", moduleName] => pure (.module moduleName.toName, none, false)
+      | ["library", libraryName] => pure (.library libraryName.toName, none, false)
+      | ["package"] => pure (.package none, none, false)
+      | ["package", packageName] => pure (.package (some packageName.toName), none, false)
+      | "module" :: _ => throw "module scope with --stdin expects exactly <module>"
+      | "library" :: _ => throw "library scope with --stdin expects exactly <library>"
+      | "package" :: _ => throw "package scope with --stdin accepts at most one <package>"
+      | _ => throw "--stdin requires an explicit module, library, or package scope"
+    else
+      match positionals.toList with
+      | [moduleName, declaration] =>
+          pure (.module moduleName.toName, some declaration, true)
+      | ["module", moduleName, declaration] =>
+          pure (.module moduleName.toName, some declaration, false)
+      | ["library", libraryName, declaration] =>
+          pure (.library libraryName.toName, some declaration, false)
+      | ["package", ".", declaration] =>
+          pure (.package none, some declaration, false)
+      | ["package", packageName, declaration] =>
+          pure (.package (some packageName.toName), some declaration, false)
+      | [] | [_] =>
+          throw "missing arguments: expected <module> <declaration> or an explicit scoped query"
+      | "module" :: _ => throw "module scope expects exactly <module> <declaration>"
+      | "library" :: _ => throw "library scope expects exactly <library> <declaration>"
+      | "package" :: _ => throw "package scope expects [<package>|.] <declaration>"
+      | _ =>
+          throw "too many positional arguments: expected <module> <declaration> or an explicit scoped query"
+  if stdin && !jsonl then
+    throw "--stdin requires --jsonl so each query has an explicit status"
+  if allowPartial && !stdin then
+    throw "--allow-partial is only supported with --stdin batch queries"
+  return {
+    scope
+    declString?
+    definedIn?
+    resolveSuffix
+    filter := { patterns }
+    jsonl
+    stdin
+    allowPartial
+    legacySyntax
+  }
+
 /-- Parse query subcommand arguments.  `none` means the user requested command help. -/
 partial def parseQueryArgsAux
     (args : List String) (positionals : Array String) (patterns : Array ModulePattern)
-    (definedIn? : Option String) (resolveSuffix jsonl : Bool) : Except String (Option QueryConfig) := do
+    (definedIn? : Option String) (resolveSuffix jsonl stdin allowPartial : Bool) :
+    Except String (Option QueryConfig) := do
   match args with
-  | [] =>
-      if positionals.size == 2 then
-        return some {
-          moduleString := positionals[0]!
-          declString := positionals[1]!
-          definedIn? := definedIn?
-          resolveSuffix := resolveSuffix
-          filter := { patterns := patterns }
-          jsonl := jsonl
-        }
-      else if positionals.size < 2 then
-        throw "missing arguments: expected <module> <declaration>"
-      else
-        throw "too many positional arguments: expected <module> <declaration>"
+  | [] => return some (← queryConfigFromPositionals positionals patterns definedIn?
+      resolveSuffix jsonl stdin allowPartial)
   | arg :: rest =>
       if arg == "--help" || arg == "-h" || (arg == "help" && positionals.isEmpty && rest.isEmpty) then
         return none
       else if arg == "--jsonl" then
-        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix true
+        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix true stdin allowPartial
+      else if arg == "--stdin" then
+        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl true allowPartial
+      else if arg == "--allow-partial" then
+        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl stdin true
       else if arg == "--resolve-suffix" then
-        parseQueryArgsAux rest positionals patterns definedIn? true jsonl
+        parseQueryArgsAux rest positionals patterns definedIn? true jsonl stdin allowPartial
       else if arg == "--defined-in" then
         match rest with
         | [] => throw "missing value after `--defined-in`"
@@ -165,7 +250,7 @@ partial def parseQueryArgsAux
             else if value.trimAscii.isEmpty then
               throw "empty module name after `--defined-in`"
             else
-              parseQueryArgsAux rest positionals patterns (some value) resolveSuffix jsonl
+              parseQueryArgsAux rest positionals patterns (some value) resolveSuffix jsonl stdin allowPartial
       else if arg.startsWith "--defined-in=" then
         if definedIn?.isSome then
           throw "`--defined-in` may only be specified once"
@@ -174,36 +259,36 @@ partial def parseQueryArgsAux
           if value.trimAscii.isEmpty then
             throw "empty module name after `--defined-in=`"
           else
-            parseQueryArgsAux rest positionals patterns (some value) resolveSuffix jsonl
+            parseQueryArgsAux rest positionals patterns (some value) resolveSuffix jsonl stdin allowPartial
       else if isModuleFilterOption arg then
         match rest with
         | [] => throw s!"missing value after `{arg}`"
         | value :: rest =>
             let patterns ← addPatternList patterns value
-            parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl
+            parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl stdin allowPartial
       else if arg.startsWith "--module=" then
         let patterns ← addPatternList patterns ((arg.drop "--module=".length).toString)
-        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl
+        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl stdin allowPartial
       else if arg.startsWith "--modules=" then
         let patterns ← addPatternList patterns ((arg.drop "--modules=".length).toString)
-        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl
+        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl stdin allowPartial
       else if arg.startsWith "--in=" then
         let patterns ← addPatternList patterns ((arg.drop "--in=".length).toString)
-        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl
+        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl stdin allowPartial
       else if arg.startsWith "--only-module=" then
         let patterns ← addPatternList patterns ((arg.drop "--only-module=".length).toString)
-        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl
+        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl stdin allowPartial
       else if arg.startsWith "-m=" then
         let patterns ← addPatternList patterns ((arg.drop "-m=".length).toString)
-        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl
+        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl stdin allowPartial
       else if arg.startsWith "-" then
         throw s!"unknown option `{arg}`"
       else
-        parseQueryArgsAux rest (positionals.push arg) patterns definedIn? resolveSuffix jsonl
+        parseQueryArgsAux rest (positionals.push arg) patterns definedIn? resolveSuffix jsonl stdin allowPartial
 
 /-- Parse query subcommand arguments.  `none` means the user requested command help. -/
 def parseQueryArgs (args : List String) : Except String (Option QueryConfig) :=
-  parseQueryArgsAux args #[] #[] none false false
+  parseQueryArgsAux args #[] #[] none false false false false
 
 /-- Top-level CLI help text. -/
 def topLevelHelp : String :=
@@ -212,6 +297,9 @@ def topLevelHelp : String :=
 Usage:
   lake exe aftk deps [options] <module> <declaration>
   lake exe aftk rdeps [options] <module> <declaration>
+  lake exe aftk rdeps [options] library <library> <declaration>
+  lake exe aftk rdeps [options] package <package> <declaration>
+  lake exe aftk rdeps [options] (module <module>|library <library>|package [<package>]) --stdin --jsonl
   lake exe aftk tech-debt [options] [module <module>|library <library>|package [<package>]]
   lake exe aftk diagnostics [options] <file>
   lake exe aftk probe [options] <module-or-file>
@@ -257,6 +345,8 @@ Notes:
   * Internal declarations are traversed but omitted from output.
   * Private declarations are included and printed with their user-facing names.
   * Module restrictions filter output only; traversal may still pass through other modules.
+  * Explicit dependency scopes import one module or every module selected by Lake facets.
+  * Batch JSONL emits one framed status record per nonempty input line and loads its scope once.
   * The diagnostics daemon is per Lake project root and stores metadata in .lake/aftk/.
 
 Run `lake exe aftk <command> --help` for command-specific options and examples."
@@ -269,6 +359,8 @@ def moduleFilterHelp : String :=
       --only-module <pattern>   Alias for --module.
       --modules <patterns>      Comma-separated module patterns.  May be repeated.
       --jsonl                   Print each result as one JSON object per line.
+      --stdin                   Read newline-delimited targets; requires an explicit scope and JSONL.
+      --allow-partial           Exit successfully when a batch contains unresolved/failed queries.
   -h, --help                    Show this help.
 
 Module patterns:
@@ -287,12 +379,20 @@ def subcommandHelp (kind : QueryKind) : String :=
 
 Usage:
   lake exe aftk {kind.command} [options] <module> <declaration>
+  lake exe aftk {kind.command} [options] module <module> <declaration>
+  lake exe aftk {kind.command} [options] library <library> <declaration>
+  lake exe aftk {kind.command} [options] package <package> <declaration>
+  lake exe aftk {kind.command} [options] package . <declaration>
+  lake exe aftk {kind.command} [options] (module <module>|library <library>|package [<package>]) --stdin --jsonl
 
 Aliases:
   {kind.aliases}
 
 Arguments:
   <module>       Lean module to import before running the query, e.g. Mathlib.Data.Nat.Basic.
+  <library>      Lake library whose complete `modules` facet is imported together.
+  <package>      Lake package whose library modules and executable roots are imported together.
+                 Use `.` to select the root package for a single query; omit it with batch stdin.
   <declaration>  Declaration to query, e.g. Nat.gcd.
 
 {moduleFilterHelp}
@@ -307,14 +407,18 @@ Target resolution:
 An exact lookup that fails also reports up to 20 suffix candidates without selecting one.
 
 Output:
-  By default, tab-separated rows: <module>\\t<declaration>.
-  With --jsonl, rows additionally expose `definingModule` and the resolved query `target`.
-  Lookup failures under --jsonl are structured error records with bounded `candidates`.
+  Legacy <module> <declaration> queries retain tab-separated rows and row-per-result JSONL.
+  Explicit scopes with --jsonl emit one record per query. `status` is `ok`, `leaf`,
+  `unresolved`, or `error`; each record includes the exact scope/import roots and a results array.
+  Batch input loads the environment once and reuses its lookup index and reverse graph.
+  A batch containing unresolved/error records exits nonzero unless --allow-partial is supplied.
 
 Examples:
   lake exe aftk {kind.command} Mathlib.Data.Nat.Basic Nat.gcd
   lake exe aftk {kind.command} Root Namespace.privateLemma --defined-in Defining.Submodule
   lake exe aftk {kind.command} Root privateLemma --resolve-suffix
+  lake exe aftk {kind.command} library Mathlib Nat.gcd --jsonl
+  printf '%s\\n' Nat.gcd Nat.coprime | lake exe aftk {kind.command} library Mathlib --stdin --jsonl
   lake exe aftk {kind.command} Mathlib.Data.Nat.Basic Nat.gcd --module 'Mathlib.Algebra.*'
   lake exe aftk {kind.command} Mathlib.Data.Nat.Basic Nat.gcd --modules 'Mathlib.Algebra.*,Mathlib.Order.*'"
 
@@ -421,6 +525,25 @@ def relevantModulesForOutput (env : Environment) (target : Name) (filter : Modul
   else
     let outputImportClosure := moduleImportClosure env (modulesMatchingFilter env filter)
     some <| NameHashSet.filter (fun moduleName => outputImportClosure.contains moduleName) importersOfTarget
+
+/--
+Modules needed by a reverse map shared across several targets.  This is the union of their reverse
+module-import closures, intersected with the imports of requested output modules when filtered.
+-/
+def relevantModulesForTargets
+    (env : Environment) (targets : Array Name) (filter : ModuleFilter) :
+    Option NameHashSet := do
+  let mut targetModules := #[]
+  for target in targets do
+    let targetModule ← moduleOf? env target
+    targetModules := targetModules.push targetModule
+  let importersOfTargets := moduleReverseImportClosure env targetModules
+  if filter.patterns.isEmpty then
+    some importersOfTargets
+  else
+    let outputImportClosure := moduleImportClosure env (modulesMatchingFilter env filter)
+    some <| NameHashSet.filter (fun moduleName => outputImportClosure.contains moduleName)
+      importersOfTargets
 
 /-- Reverse adjacency map for the direct dependency graph. -/
 abbrev ReverseDependencyMap := Std.HashMap Name (Array Name)
@@ -650,10 +773,11 @@ Suffix resolution is explicit and compares `Name` components rather than rendere
 -/
 def resolveDeclaration
     (env : Environment) (scopeModule rawDeclName : Name) (definedIn? : Option Name := none)
-    (resolveSuffix : Bool := false) : Except ResolutionFailure ResolvedDeclaration := do
+    (resolveSuffix : Bool := false) (index? : Option (Array ResolvedDeclaration) := none) :
+    Except ResolutionFailure ResolvedDeclaration := do
   let declName := privateToUserName rawDeclName
   if resolveSuffix then
-    let index := declarationIndex env
+    let index := match index? with | some index => index | none => declarationIndex env
     let found := suffixCandidates env index declName definedIn?
     if _h : found.size == 1 then
       return found[0]!
@@ -673,7 +797,7 @@ def resolveDeclaration
           throw <| resolutionFailure "declarationNotFound"
             s!"no declaration with suffix `{declName}` was found in the environment of module `{scopeModule}`" #[]
   else if let some definingModule := definedIn? then
-    let index := declarationIndex env
+    let index := match index? with | some index => index | none => declarationIndex env
     let found := exactUserCandidates index declName (some definingModule)
     if _h : found.size == 1 then
       return found[0]!
@@ -699,7 +823,8 @@ def resolveDeclaration
       return resolvedDeclaration env privateCandidate
     if (env.find? declName).isSome then
       return resolvedDeclaration env declName
-    let suggestions := suffixCandidates env (declarationIndex env) declName
+    let index := match index? with | some index => index | none => declarationIndex env
+    let suggestions := suffixCandidates env index declName
     throw <| resolutionFailure "declarationNotFound"
       s!"declaration `{declName}` was not found in the environment of module `{scopeModule}`" suggestions
 
@@ -761,16 +886,17 @@ def formatResolutionFailure (failure : ResolutionFailure) : String :=
     let omittedLine := if omitted == 0 then [] else [s!"  ... and {omitted} more"]
     s!"error: {failure.message}\nCandidates (<defining-module>::<declaration>):\n{String.intercalate "\n" (candidateLines ++ omittedLine)}"
 
-/-- Structured JSONL lookup error for agent callers. -/
-def formatResolutionFailureJsonLine (config : QueryConfig) (failure : ResolutionFailure) : String :=
+/-- Structured JSONL lookup error for the legacy single-module interface. -/
+def formatResolutionFailureJsonLine
+    (config : QueryConfig) (rawDeclaration : String) (failure : ResolutionFailure) : String :=
   let definedInJson := match config.definedIn? with
     | some moduleName => Json.str moduleName
     | none => Json.null
   Json.compress <| Json.mkObj [
     ("type", "error"),
-    ("scopeModule", config.moduleString),
+    ("scopeModule", s!"{config.scope.resolutionModule}"),
     ("requestedTarget", Json.mkObj [
-      ("declaration", config.declString),
+      ("declaration", rawDeclaration),
       ("definedIn", definedInJson),
       ("resolution", if config.resolveSuffix then "suffix" else "exact")
     ]),
@@ -783,25 +909,32 @@ def formatResolutionFailureJsonLine (config : QueryConfig) (failure : Resolution
     ("candidates", Json.arr <| failure.candidates.map resolvedDeclarationJson)
   ]
 
-/-- Load `moduleName`, including private module data, so private declarations can participate. -/
-def loadModuleEnvironment (moduleName : Name) : IO Environment := do
-  let imports : Array Import := #[{ module := moduleName }]
+/-- Load modules together, including private data, so declarations can participate across roots. -/
+def loadModulesEnvironment (moduleNames : Array Name) : IO Environment := do
+  if moduleNames.isEmpty then
+    throw <| IO.userError "the selected query scope contains no Lean modules"
+  let imports : Array Import := moduleNames.map fun moduleName => { module := moduleName }
   importModules imports Options.empty 0 (leakEnv := true) (loadExts := true) (level := .private)
 
-/-- Run a dependency query and print the result. -/
-def runQuery (kind : QueryKind) (config : QueryConfig) : IO UInt32 := do
-  let moduleName := config.moduleString.toName
-  let rawDeclName := config.declString.toName
-  let definedIn? := config.definedIn?.map String.toName
-  let env ← loadModuleEnvironment moduleName
-  let target ← match resolveDeclaration env moduleName rawDeclName definedIn? config.resolveSuffix with
-    | .ok target => pure target
-    | .error failure =>
-        if config.jsonl then
-          IO.println (formatResolutionFailureJsonLine config failure)
-        else
-          IO.eprintln (formatResolutionFailure failure)
-        return (1 : UInt32)
+/-- Load `moduleName`, including private module data, so private declarations can participate. -/
+def loadModuleEnvironment (moduleName : Name) : IO Environment :=
+  loadModulesEnvironment #[moduleName]
+
+/-- Resolve a query scope to the module roots that should be imported together. -/
+def modulesForQueryScope (scope : QueryScope) : IO (Array Name) := do
+  match scope with
+  | .module moduleName => return #[moduleName]
+  | .library libraryName =>
+      let workspace ← TechDebt.loadProjectWorkspace
+      TechDebt.modulesForScope workspace (.library libraryName)
+  | .package packageName? =>
+      let workspace ← TechDebt.loadProjectWorkspace
+      TechDebt.modulesForScope workspace (.package packageName?)
+
+/-- The declarations reachable for one target, optionally using a batch-shared reverse map. -/
+def queryResults
+    (kind : QueryKind) (env : Environment) (config : QueryConfig)
+    (target : ResolvedDeclaration) (sharedReverse? : Option ReverseDependencyMap := none) : Array Name :=
   let out :=
     match kind with
     | .dependencies =>
@@ -809,28 +942,179 @@ def runQuery (kind : QueryKind) (config : QueryConfig) : IO UInt32 := do
         displayableReachable env target.name config.filter reachable
     | .dependents =>
         let reachable :=
-          if config.filter.patterns.isEmpty then
-            let reverse := reverseDependencyMap env (relevantModulesForOutput env target.name config.filter)
-            reachableFrom target.name (directDependents reverse)
-          else
-            match relevantModulesForOutput env target.name config.filter with
-            | some relevantModules =>
-                let outputConstCount := constantCountForFilter env config.filter
-                let relevantConstCount := constantCountInModules env (some relevantModules)
-                if useReverseScanForFilteredRdeps outputConstCount relevantConstCount then
-                  let reverse := reverseDependencyMap env (some relevantModules)
-                  reachableFrom target.name (directDependents reverse)
-                else
-                  dependentReachableViaOutputClosure env target.name config.filter
-            | none =>
+          match sharedReverse? with
+          | some reverse => reachableFrom target.name (directDependents reverse)
+          | none =>
+            if config.filter.patterns.isEmpty then
+              let reverse := reverseDependencyMap env (relevantModulesForOutput env target.name config.filter)
+              reachableFrom target.name (directDependents reverse)
+            else
+              match relevantModulesForOutput env target.name config.filter with
+              | some relevantModules =>
+                  let outputConstCount := constantCountForFilter env config.filter
+                  let relevantConstCount := constantCountInModules env (some relevantModules)
+                  if useReverseScanForFilteredRdeps outputConstCount relevantConstCount then
+                    let reverse := reverseDependencyMap env (some relevantModules)
+                    reachableFrom target.name (directDependents reverse)
+                  else
+                    dependentReachableViaOutputClosure env target.name config.filter
+              | none =>
                 dependentReachableViaOutputClosure env target.name config.filter
         displayableReachable env target.name config.filter reachable
-  for declName in out do
-    if config.jsonl then
-      IO.println (formatDeclarationJsonLine env moduleName target declName)
+  out
+
+/-- The exact configured import roots and their Lake scope identity. -/
+def queryScopeJson (scope : QueryScope) (moduleNames : Array Name) (filter : ModuleFilter) : Json :=
+  Json.mkObj [
+    ("kind", scope.kind),
+    ("name", match scope.name? with | some name => Json.str s!"{name}" | none => Json.null),
+    ("modules", Json.arr <| moduleNames.map fun moduleName => Json.str s!"{moduleName}"),
+    ("outputFilter", Json.arr <| filter.patterns.map fun pattern => Json.str pattern.format)
+  ]
+
+/-- A result declaration in batch/scoped output. -/
+def queryResultJson (env : Environment) (declName : Name) : Json :=
+  let definingModule := moduleOfD env declName
+  Json.mkObj [
+    ("module", s!"{definingModule}"),
+    ("definingModule", s!"{definingModule}"),
+    ("declaration", s!"{privateToUserName declName}")
+  ]
+
+/-- The input identity repeated on every framed query result. -/
+def queryInputJson (config : QueryConfig) (rawDeclaration : String) : Json :=
+  Json.mkObj [
+    ("declaration", rawDeclaration),
+    ("definedIn", match config.definedIn? with | some name => Json.str name | none => Json.null),
+    ("resolution", if config.resolveSuffix then "suffix" else "exact")
+  ]
+
+/-- Count distinct defining modules represented by a result array. -/
+def distinctResultModuleCount (env : Environment) (results : Array Name) : Nat := Id.run do
+  let mut modules : NameHashSet := {}
+  for declName in results do
+    modules := modules.insert (moduleOfD env declName)
+  return modules.size
+
+/-- One framed JSONL record for a successfully resolved scoped query. -/
+def formatScopedQueryJsonLine
+    (kind : QueryKind) (config : QueryConfig) (moduleNames : Array Name) (env : Environment)
+    (rawDeclaration : String) (target : ResolvedDeclaration) (results : Array Name) : String :=
+  Json.compress <| Json.mkObj [
+    ("type", "query"),
+    ("query", kind.command),
+    ("input", queryInputJson config rawDeclaration),
+    ("scope", queryScopeJson config.scope moduleNames config.filter),
+    ("status", if results.isEmpty then "leaf" else "ok"),
+    ("target", resolvedDeclarationJson target),
+    ("resultCount", toJson results.size),
+    ("moduleCount", toJson (distinctResultModuleCount env results)),
+    ("results", Json.arr <| results.map (queryResultJson env))
+  ]
+
+/-- One framed JSONL record for a target that could not be resolved in the selected scope. -/
+def formatScopedResolutionFailureJsonLine
+    (kind : QueryKind) (config : QueryConfig) (moduleNames : Array Name)
+    (rawDeclaration : String) (failure : ResolutionFailure) : String :=
+  Json.compress <| Json.mkObj [
+    ("type", "query"),
+    ("query", kind.command),
+    ("input", queryInputJson config rawDeclaration),
+    ("scope", queryScopeJson config.scope moduleNames config.filter),
+    ("status", "unresolved"),
+    ("error", Json.mkObj [("code", failure.code), ("message", failure.message)]),
+    ("candidateCount", toJson failure.totalCandidates),
+    ("truncated", toJson (decide (failure.totalCandidates > failure.candidates.size))),
+    ("candidates", Json.arr <| failure.candidates.map resolvedDeclarationJson)
+  ]
+
+/-- One framed JSONL record for an unexpected failure while evaluating a resolved query. -/
+def formatScopedQueryErrorJsonLine
+    (kind : QueryKind) (config : QueryConfig) (moduleNames : Array Name)
+    (rawDeclaration : String) (target : ResolvedDeclaration) (diagnostic : String) : String :=
+  Json.compress <| Json.mkObj [
+    ("type", "query"),
+    ("query", kind.command),
+    ("input", queryInputJson config rawDeclaration),
+    ("scope", queryScopeJson config.scope moduleNames config.filter),
+    ("status", "error"),
+    ("target", resolvedDeclarationJson target),
+    ("error", Json.mkObj [("code", "queryError"), ("message", diagnostic)])
+  ]
+
+/-- Read nonempty, trimmed newline-delimited declaration targets. -/
+def queryTargetStrings (config : QueryConfig) : IO (Array String) := do
+  if config.stdin then
+    let input ← (← IO.getStdin).readToEnd
+    let targets := (input.splitOn "\n").foldl (init := #[]) fun targets line =>
+      let target := line.trimAscii.toString
+      if target.isEmpty then targets else targets.push target
+    if targets.isEmpty then
+      throw <| IO.userError "--stdin did not contain any declaration targets"
+    return targets
+  else
+    match config.declString? with
+    | some declaration => return #[declaration]
+    | none => throw <| IO.userError "missing declaration target"
+
+/-- Run dependency queries after loading their shared environment exactly once. -/
+def runQuery (kind : QueryKind) (config : QueryConfig) : IO UInt32 := do
+  unless config.legacySyntax do
+    TechDebt.addProjectLeanSearchPath
+  let moduleNames ← modulesForQueryScope config.scope
+  let env ← loadModulesEnvironment moduleNames
+  let rawDeclarations ← queryTargetStrings config
+  let definedIn? := config.definedIn?.map String.toName
+  let index? := if config.stdin then some (declarationIndex env) else none
+  let prepared : Array (String × Except ResolutionFailure ResolvedDeclaration) :=
+    rawDeclarations.map fun rawDeclaration =>
+      (rawDeclaration, resolveDeclaration env config.scope.resolutionModule rawDeclaration.toName
+        definedIn? config.resolveSuffix index?)
+  let resolvedNames := prepared.filterMap fun (_, resolution) =>
+    match resolution with
+    | .ok target => some target.name
+    | .error _ => none
+  let sharedReverse? :=
+    if kind == .dependents && config.stdin then
+      some (reverseDependencyMap env (relevantModulesForTargets env resolvedNames config.filter))
     else
-      IO.println (formatDeclaration env declName)
-  return (0 : UInt32)
+      none
+  let mut succeeded := true
+  for (rawDeclaration, resolution) in prepared do
+    match resolution with
+    | .error failure =>
+        succeeded := false
+        if config.legacySyntax then
+          if config.jsonl then
+            IO.println (formatResolutionFailureJsonLine config rawDeclaration failure)
+          else
+            IO.eprintln (formatResolutionFailure failure)
+        else if config.jsonl then
+          IO.println (formatScopedResolutionFailureJsonLine kind config moduleNames rawDeclaration failure)
+        else
+          IO.eprintln (formatResolutionFailure failure)
+    | .ok target =>
+        try
+          let results := queryResults kind env config target sharedReverse?
+          if config.legacySyntax then
+            for declName in results do
+              if config.jsonl then
+                IO.println (formatDeclarationJsonLine env config.scope.resolutionModule target declName)
+              else
+                IO.println (formatDeclaration env declName)
+          else if config.jsonl then
+            IO.println (formatScopedQueryJsonLine kind config moduleNames env rawDeclaration target results)
+          else
+            for declName in results do
+              IO.println (formatDeclaration env declName)
+        catch e =>
+          succeeded := false
+          if config.legacySyntax || !config.jsonl then
+            IO.eprintln s!"error: query for `{rawDeclaration}` failed: {e}"
+          else
+            IO.println (formatScopedQueryErrorJsonLine kind config moduleNames rawDeclaration target
+              (toString e))
+  return if succeeded || config.allowPartial then 0 else 1
 
 /-- Safe part of the CLI entry point. -/
 def run (args : List String) : IO UInt32 := do

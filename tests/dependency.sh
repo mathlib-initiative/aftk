@@ -14,7 +14,7 @@ trap cleanup EXIT
 cat > "$PROJECT/lakefile.toml" <<'EOF'
 name = "dependency_test"
 version = "0.1.0"
-defaultTargets = ["Discovery"]
+defaultTargets = ["Discovery", "SplitWorkspace", "DownstreamWorkspace"]
 
 [[require]]
 name = "aftk"
@@ -22,6 +22,15 @@ path = "aftk-dependency"
 
 [[lean_lib]]
 name = "Discovery"
+
+[[lean_lib]]
+name = "SplitWorkspace"
+srcDir = "WorkspaceSource"
+roots = ["Workspace.Core", "Workspace.Sibling", "Workspace.Leaf"]
+
+[[lean_lib]]
+name = "DownstreamWorkspace"
+roots = ["Workspace.Downstream"]
 EOF
 ln -s "$ROOT" "$PROJECT/aftk-dependency"
 cp "$ROOT/lean-toolchain" "$PROJECT/lean-toolchain"
@@ -96,8 +105,191 @@ def usesQuoted : Nat := Alpha.«quoted.name»
 end RootFixture
 EOF
 
+# SplitWorkspace deliberately has no umbrella module. Its roots are only related by selected
+# imports, while DownstreamWorkspace imports it from a second library in the same package.
+mkdir -p "$PROJECT/WorkspaceSource/Workspace" "$PROJECT/Workspace"
+cat > "$PROJECT/WorkspaceSource/Workspace/Core.lean" <<'EOF'
+module
+
+public section
+
+namespace Workspace
+
+def seed : Nat := 1
+def leaf : Nat := 2
+def tick' : Nat := seed
+
+end Workspace
+EOF
+cat > "$PROJECT/WorkspaceSource/Workspace/Sibling.lean" <<'EOF'
+module
+
+public import Workspace.Core
+
+public section
+
+namespace Workspace
+
+def siblingUser : Nat := seed
+def tickUser : Nat := tick'
+
+end Workspace
+EOF
+cat > "$PROJECT/WorkspaceSource/Workspace/Leaf.lean" <<'EOF'
+module
+
+public section
+
+namespace Workspace
+
+def independent : Nat := 3
+
+end Workspace
+EOF
+cat > "$PROJECT/Workspace/Downstream.lean" <<'EOF'
+module
+
+public import Workspace.Sibling
+
+public section
+
+namespace Workspace
+
+def downstreamUser : Nat := siblingUser + seed
+
+end Workspace
+EOF
+
 lake env lean --run "$ROOT/tests/dependency_resolution.lean"
 (cd "$PROJECT" && lake build)
+
+printf 'test: explicit module scope reports a framed query status\n'
+(cd "$PROJECT" && lake exe aftk rdeps module Workspace.Sibling Workspace.seed \
+  --jsonl > module-scope.jsonl)
+python3 - "$PROJECT/module-scope.jsonl" <<'PY'
+import json, sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    row = json.load(stream)
+assert row["type"] == "query"
+assert row["query"] == "rdeps"
+assert row["status"] == "ok"
+assert row["scope"] == {
+    "kind": "module", "name": "Workspace.Sibling", "modules": ["Workspace.Sibling"],
+    "outputFilter": [],
+}
+assert [(item["module"], item["declaration"]) for item in row["results"]] == [
+    ("Workspace.Core", "Workspace.tick'"),
+    ("Workspace.Sibling", "Workspace.siblingUser"),
+    ("Workspace.Sibling", "Workspace.tickUser"),
+]
+PY
+
+printf 'test: library scope imports every configured root without an umbrella module\n'
+(cd "$PROJECT" && lake exe aftk rdeps library SplitWorkspace Workspace.seed \
+  --jsonl > library-scope.jsonl)
+python3 - "$PROJECT/library-scope.jsonl" <<'PY'
+import json, sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    row = json.load(stream)
+assert row["scope"] == {
+    "kind": "library",
+    "name": "SplitWorkspace",
+    "modules": ["Workspace.Core", "Workspace.Leaf", "Workspace.Sibling"],
+    "outputFilter": [],
+}
+assert row["status"] == "ok"
+assert row["resultCount"] == 3
+assert row["moduleCount"] == 2
+assert [item["declaration"] for item in row["results"]] == [
+    "Workspace.tick'", "Workspace.siblingUser", "Workspace.tickUser"
+]
+PY
+(cd "$PROJECT" && lake exe aftk rdeps library SplitWorkspace Workspace.seed \
+  --module Workspace.Sibling --jsonl > filtered-scope.jsonl)
+python3 - "$PROJECT/filtered-scope.jsonl" <<'PY'
+import json, sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    row = json.load(stream)
+assert row["scope"]["outputFilter"] == ["Workspace.Sibling"]
+assert row["moduleCount"] == 1
+assert [item["declaration"] for item in row["results"]] == [
+    "Workspace.siblingUser", "Workspace.tickUser"
+]
+PY
+
+printf 'test: batch queries frame leaf, non-leaf, apostrophe, and unresolved targets\n'
+if (cd "$PROJECT" && printf '%s\n' Workspace.seed Workspace.leaf "Workspace.tick'" Workspace.missing | \
+    lake exe aftk rdeps library SplitWorkspace --stdin --jsonl > batch.jsonl); then
+  echo 'mixed batch unexpectedly succeeded' >&2
+  exit 1
+fi
+if (cd "$PROJECT" && printf '%s\n' Workspace.seed Workspace.leaf "Workspace.tick'" Workspace.missing | \
+    lake exe aftk rdeps library SplitWorkspace --stdin --jsonl > batch-repeat.jsonl); then
+  echo 'repeated mixed batch unexpectedly succeeded' >&2
+  exit 1
+fi
+cmp "$PROJECT/batch.jsonl" "$PROJECT/batch-repeat.jsonl"
+python3 - "$PROJECT/batch.jsonl" <<'PY'
+import json, sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    rows = [json.loads(line) for line in stream if line.strip()]
+assert [row["input"]["declaration"] for row in rows] == [
+    "Workspace.seed", "Workspace.leaf", "Workspace.tick'", "Workspace.missing"
+]
+assert [row["status"] for row in rows] == ["ok", "leaf", "ok", "unresolved"]
+assert [item["declaration"] for item in rows[0]["results"]] == [
+    "Workspace.tick'", "Workspace.siblingUser", "Workspace.tickUser"
+]
+assert rows[1]["resultCount"] == rows[1]["moduleCount"] == 0
+assert [item["declaration"] for item in rows[2]["results"]] == ["Workspace.tickUser"]
+assert rows[3]["error"]["code"] == "declarationNotFound"
+assert all(row["scope"] == rows[0]["scope"] for row in rows)
+PY
+(cd "$PROJECT" && printf '%s\n' Workspace.seed Workspace.missing | \
+  lake exe aftk rdeps library SplitWorkspace --stdin --jsonl --allow-partial \
+    > allowed-batch.jsonl)
+
+printf 'test: package scope includes dependents from a second library\n'
+(cd "$PROJECT" && printf '%s\n' Workspace.seed | \
+  lake exe aftk rdeps package dependency_test --stdin --jsonl > package-scope.jsonl)
+(cd "$PROJECT" && printf '%s\n' Workspace.seed | \
+  lake exe aftk rdeps package --stdin --jsonl > root-package-scope.jsonl)
+python3 - "$PROJECT/package-scope.jsonl" <<'PY'
+import json, sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    row = json.load(stream)
+assert row["scope"]["kind"] == "package"
+assert row["scope"]["name"] == "dependency_test"
+assert row["scope"]["modules"] == [
+    "Discovery", "Discovery.A", "Discovery.B", "Workspace.Core",
+    "Workspace.Downstream", "Workspace.Leaf", "Workspace.Sibling",
+]
+assert [(item["module"], item["declaration"]) for item in row["results"]] == [
+    ("Workspace.Core", "Workspace.tick'"),
+    ("Workspace.Downstream", "Workspace.downstreamUser"),
+    ("Workspace.Sibling", "Workspace.siblingUser"),
+    ("Workspace.Sibling", "Workspace.tickUser"),
+]
+assert row["resultCount"] == 4
+assert row["moduleCount"] == 3
+PY
+python3 - "$PROJECT/package-scope.jsonl" "$PROJECT/root-package-scope.jsonl" <<'PY'
+import json, sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    named = json.load(stream)
+with open(sys.argv[2], encoding="utf-8") as stream:
+    root = json.load(stream)
+assert root["scope"]["name"] is None
+assert root["scope"]["modules"] == named["scope"]["modules"]
+assert root["status"] == named["status"]
+assert root["results"] == named["results"]
+PY
 
 # Exact public lookup remains compatible, including apostrophes.
 (cd "$PROJECT" && lake exe aftk rdeps Discovery Alpha.exactPublic \
