@@ -165,6 +165,27 @@ IFS=$'\t' read -r defining_module private_declaration <<< "$private_row"
 grep -Fqx $'Discovery.A\tPrivateFixture.usePrivateA' "$PROJECT/private-rdeps.tsv"
 grep -Fqx $'Discovery\tRootFixture.downstreamA' "$PROJECT/private-rdeps.tsv"
 
+# The equivalent private JSON result fields are directly reusable too.
+(cd "$PROJECT" && lake exe aftk deps Discovery.A PrivateFixture.usePrivateA \
+  --module Discovery.A --jsonl > private-deps.jsonl)
+json_private_row=$(python3 - "$PROJECT/private-deps.jsonl" <<'PY'
+import json, sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    rows = [json.loads(line) for line in stream if line.strip()]
+assert len(rows) == 1
+row = rows[0]
+assert row["module"] == row["definingModule"] == "Discovery.A"
+assert row["declaration"] == "PrivateFixture.sharedPrivate"
+print(f'{row["definingModule"]}\t{row["declaration"]}')
+PY
+)
+IFS=$'\t' read -r json_defining_module json_private_declaration <<< "$json_private_row"
+(cd "$PROJECT" && lake exe aftk rdeps Discovery "$json_private_declaration" \
+  --defined-in "$json_defining_module" --modules 'Discovery.A,Discovery' \
+  > private-json-roundtrip.tsv)
+cmp "$PROJECT/private-rdeps.tsv" "$PROJECT/private-json-roundtrip.tsv"
+
 # JSON rows expose the imported scope, result module, and resolved private target separately.
 (cd "$PROJECT" && lake exe aftk rdeps Discovery "$private_declaration" \
   --defined-in "$defining_module" --module Discovery --jsonl > private-rdeps.jsonl)
