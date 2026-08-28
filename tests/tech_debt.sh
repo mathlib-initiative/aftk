@@ -24,6 +24,10 @@ weak.techDebtTest.required = true
 name = "aftk"
 path = "aftk-dependency"
 
+[[require]]
+name = "partial_fixture"
+path = "partial-fixture"
+
 [[lean_lib]]
 name = "TechDebtTest"
 
@@ -311,6 +315,42 @@ module
 
 -- This file is deliberately outside every configured target.
 set_option maxHeartbeats 400000
+EOF
+mkdir -p "$PROJECT/partial-fixture/CustomSource/PartialDebt"
+cat > "$PROJECT/partial-fixture/lakefile.toml" <<'EOF'
+name = "partial_fixture"
+version = "0.1.0"
+
+[[lean_lib]]
+name = "PartialDebt"
+srcDir = "CustomSource"
+roots = ["PartialDebt.ABefore", "PartialDebt.MBroken", "PartialDebt.ZAfter"]
+EOF
+cp "$ROOT/lean-toolchain" "$PROJECT/partial-fixture/lean-toolchain"
+cat > "$PROJECT/partial-fixture/CustomSource/PartialDebt/ABefore.lean" <<'EOF'
+module
+
+set_option maxHeartbeats 111111
+
+def beforeFailure : Nat := 1
+EOF
+cat > "$PROJECT/partial-fixture/CustomSource/PartialDebt/MBroken.lean" <<'EOF'
+module
+
+def brokenDeclaration : Nat := unknownIdentifier
+EOF
+cat > "$PROJECT/partial-fixture/CustomSource/PartialDebt/ZAfter.lean" <<'EOF'
+module
+
+set_option maxHeartbeats 333333
+
+def afterFailure : Nat := 3
+EOF
+cat > "$PROJECT/partial-fixture/CustomSource/PartialDebt/Orphan.lean" <<'EOF'
+module
+
+-- This file is under srcDir but deliberately outside the library's configured roots.
+set_option maxHeartbeats 999999
 EOF
 (cd "$PROJECT" && lake build)
 
@@ -606,6 +646,75 @@ printf 'test: tech-debt scans a named package\n'
   package tech_debt_test > named-package.jsonl)
 cmp "$PROJECT/package.jsonl" "$PROJECT/named-package.jsonl"
 
+printf 'test: tech-debt isolates modules, retains partial results, and reports deterministic failures\n'
+if (cd "$PROJECT" && lake exe aftk tech-debt --jsonl --jobs 1 --markers maxHeartbeats \
+    library PartialDebt > partial-jobs-1.jsonl 2> partial-jobs-1.err); then
+  echo 'incomplete single-job scan unexpectedly succeeded' >&2
+  exit 1
+fi
+if (cd "$PROJECT" && lake exe aftk tech-debt --jsonl --jobs=2 --markers maxHeartbeats \
+    library PartialDebt > partial-jobs-2.jsonl 2> partial-jobs-2.err); then
+  echo 'incomplete two-job scan unexpectedly succeeded' >&2
+  exit 1
+fi
+cmp "$PROJECT/partial-jobs-1.jsonl" "$PROJECT/partial-jobs-2.jsonl"
+[[ ! -s "$PROJECT/partial-jobs-1.err" ]]
+[[ ! -s "$PROJECT/partial-jobs-2.err" ]]
+python3 - "$PROJECT/partial-jobs-1.jsonl" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    records = [json.loads(line) for line in stream if line.strip()]
+
+assert [(record["module"], record["type"]) for record in records] == [
+    ("PartialDebt.ABefore", "finding"),
+    ("PartialDebt.MBroken", "error"),
+    ("PartialDebt.ZAfter", "finding"),
+], records
+assert [record["kind"] for record in records if record["type"] == "finding"] == [
+    "maxHeartbeats", "maxHeartbeats"
+], records
+failure = records[1]
+assert failure["phase"] == "elaboration", failure
+assert "unknownIdentifier" in failure["diagnostic"], failure
+assert all(record["module"] != "PartialDebt.Orphan" for record in records), records
+PY
+
+printf 'test: tech-debt allows explicit partial success for library and package scopes\n'
+(cd "$PROJECT" && lake exe aftk tech-debt --jsonl --allow-partial --jobs 2 \
+  --markers maxHeartbeats library PartialDebt > allowed-library.jsonl)
+(cd "$PROJECT" && lake exe aftk tech-debt --jsonl --allow-partial --jobs 2 \
+  --markers maxHeartbeats package partial_fixture > allowed-package.jsonl)
+cmp "$PROJECT/partial-jobs-1.jsonl" "$PROJECT/allowed-library.jsonl"
+cmp "$PROJECT/allowed-library.jsonl" "$PROJECT/allowed-package.jsonl"
+
+printf 'test: tech-debt keeps findings on stdout and module failures on stderr in text mode\n'
+if (cd "$PROJECT" && lake exe aftk tech-debt --jobs 2 --markers maxHeartbeats \
+    library PartialDebt > partial.tsv 2> partial.err); then
+  echo 'incomplete text scan unexpectedly succeeded' >&2
+  exit 1
+fi
+[[ "$(wc -l < "$PROJECT/partial.tsv")" -eq 2 ]]
+grep -q $'ABefore.lean:3:1\tmaxHeartbeats\t' "$PROJECT/partial.tsv"
+grep -q $'ZAfter.lean:3:1\tmaxHeartbeats\t' "$PROJECT/partial.tsv"
+grep -q 'module `PartialDebt.MBroken` failed during elaboration' "$PROJECT/partial.err"
+grep -q 'unknownIdentifier' "$PROJECT/partial.err"
+
+printf 'test: tech-debt validates bounded job counts\n'
+if (cd "$PROJECT" && lake exe aftk tech-debt --jobs 0 --markers maxHeartbeats \
+    library PartialDebt > invalid-jobs.out 2> invalid-jobs.err); then
+  echo 'tech-debt unexpectedly accepted zero jobs' >&2
+  exit 1
+fi
+grep -q 'job count must be at least 1' "$PROJECT/invalid-jobs.err"
+if (cd "$PROJECT" && lake exe aftk tech-debt --jobs=nope --markers maxHeartbeats \
+    library PartialDebt > invalid-jobs-string.out 2> invalid-jobs-string.err); then
+  echo 'tech-debt unexpectedly accepted a nonnumeric job count' >&2
+  exit 1
+fi
+grep -q 'expected a positive integer' "$PROJECT/invalid-jobs-string.err"
+
 printf 'test: tech-debt compatibility syntax, default output, and help\n'
 (cd "$PROJECT" && lake exe aftk tech-debt --markers maxHeartbeats,erw \
   TechDebtTest.Example > findings.tsv)
@@ -624,5 +733,6 @@ assert rows[2][3] == "maxHeartbeats 1000000", rows
 PY
 (cd "$PROJECT" && lake exe aftk help tech-debt) | grep -q 'Find technical debt'
 (cd "$PROJECT" && lake exe aftk help tech-debt) | grep -q -- '--option <name>'
+(cd "$PROJECT" && lake exe aftk help tech-debt) | grep -q -- '--jobs <n>'
 
 printf 'all tech-debt tests passed\n'

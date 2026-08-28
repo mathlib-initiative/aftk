@@ -104,6 +104,7 @@ lake exe aftk tech-debt --markers sorry,axiom package my_package
 lake exe aftk tech-debt --markers deprecated                 # root package
 lake exe aftk tech-debt --markers simpNF A.B.C --jsonl       # module shorthand
 lake exe aftk tech-debt --option linter.style.* module A.B.C
+lake exe aftk tech-debt --jobs 2 --all-markers library MyLibrary
 ```
 
 `--markers` accepts a comma-separated list and may be repeated. Supported marker names are `maxHeartbeats`, `maxRecDepth`, `maxSynthPendingDepth`, `unlockLimits`, `backwardOption`, `linterFlexible`, `linterOverlappingInstances`, `linterAuxLemma`, `linterDeprecated`, `linterUnused`, `autoImplicit`, `simpVarHead`, `developmentOption`, `longFile`, `erw`, `simpInstances`, `dsimpInstances`, `adaptationNote`, `simpNF`, `exposePublic`, `finCommRing`, `finNatCast`, `sorry`, `deprecated`, and `axiom`. Run `lake exe aftk help tech-debt` for their descriptions.
@@ -112,7 +113,11 @@ lake exe aftk tech-debt --option linter.style.* module A.B.C
 
 Library scans use Lake's `modules` facet, so they follow the library's configured roots and local
 imports. Package scans combine those facet results for every Lean library in the package and add
-the root module of each configured Lean executable.
+the root module of each configured Lean executable. Multi-module scans run each module in an
+isolated process so completed imports are released, with bounded concurrency controlled by
+`--jobs <n>` (default 1). Findings and module failures are emitted in deterministic module order.
+An incomplete scan exits nonzero after retaining findings from successful modules; use
+`--allow-partial` to explicitly accept partial success.
 
 The default output is tab-separated:
 
@@ -121,3 +126,6 @@ The default output is tab-separated:
 ```
 
 Every option-derived finding includes its reprinted name and value as `detail`. JSONL output also includes its syntactic `scope` (`command`, `term`, or `tactic`); non-option findings omit both fields.
+JSONL records have `type` set to `finding` or `error`. Error records include the failed `module`,
+the `phase` (`source-resolution`, `parse`, `header`, `elaboration`, or `internal`), and a
+`diagnostic`. In the default text format, module failures are written to standard error.

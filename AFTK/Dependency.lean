@@ -646,7 +646,6 @@ def run (args : List String) : IO UInt32 := do
             return (0 : UInt32)
         | .ok (some config) =>
             TechDebt.run config
-            return (0 : UInt32)
         | .error msg =>
             IO.eprintln s!"error: {msg}\n\n{TechDebt.cliHelp}"
             return (1 : UInt32)

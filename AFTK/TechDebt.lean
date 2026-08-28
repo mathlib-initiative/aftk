@@ -227,6 +227,10 @@ structure Config where
   markers : Array Kind
   optionSelectors : Array OptionSelector := #[]
   jsonl : Bool := false
+  jobs : Nat := 1
+  allowPartial : Bool := false
+  /-- Run exactly one module in-process for the isolated multi-module coordinator. -/
+  internalWorker : Bool := false
   deriving Inhabited
 
 /-- Help text for the `tech-debt` command. -/
@@ -251,6 +255,8 @@ Options:
   --markers <list>  Comma-separated marker names. May be repeated.
   --all-markers     Select every supported built-in marker.
   --option <name>   Select an exact option name or a namespace ending in `.*`. May be repeated.
+  --jobs <n>        Run at most <n> isolated module scans concurrently (default: 1).
+  --allow-partial   Exit successfully after reporting any failed modules.
   --jsonl           Print one JSON object per finding instead of tab-separated rows.
   -h, --help        Show this help.
 
@@ -259,7 +265,9 @@ Markers:
 
 Output:
   By default: <file>:<line>:<column>\t<kind>\t<description>[\t<detail>].
-  Positions are 1-based."
+  Positions are 1-based. Module failures are written to standard error.
+  With --jsonl, findings and failures are discriminated by `type`; failure records include
+  `module`, `phase`, and `diagnostic`."
 
 /-- Interpret positional arguments as a scan scope. -/
 def parseScope (positionals : Array String) : Except String Scope := do
@@ -306,7 +314,8 @@ def normalizeOptionSelectors (selectors : Array OptionSelector) : Array OptionSe
 /-- Parse `tech-debt` command arguments. `none` means help was requested. -/
 def parseArgs (args : List String) : Except String (Option Config) := do
   let rec go (args : List String) (jsonl : Bool) (markers? : Option (Array Kind))
-      (optionSelectors : Array OptionSelector) (positionals : Array String) :
+      (optionSelectors : Array OptionSelector) (jobs : Nat) (allowPartial : Bool)
+      (internalWorker : Bool) (positionals : Array String) :
       Except String (Option Config) := do
     match args with
     | [] =>
@@ -317,30 +326,58 @@ def parseArgs (args : List String) : Except String (Option Config) := do
           markers := normalizeMarkers (markers?.getD #[])
           optionSelectors := normalizeOptionSelectors optionSelectors
           jsonl
+          jobs
+          allowPartial
+          internalWorker
         }
     | "--help" :: _ | "-h" :: _ => return none
-    | "--jsonl" :: rest => go rest true markers? optionSelectors positionals
-    | "--all-markers" :: rest => go rest jsonl (some Kind.all) optionSelectors positionals
+    | "--jsonl" :: rest =>
+        go rest true markers? optionSelectors jobs allowPartial internalWorker positionals
+    | "--allow-partial" :: rest =>
+        go rest jsonl markers? optionSelectors jobs true internalWorker positionals
+    | "--internal-worker" :: rest =>
+        go rest jsonl markers? optionSelectors jobs allowPartial true positionals
+    | "--jobs" :: value :: rest =>
+        let some parsed := value.toNat?
+          | throw s!"invalid job count `{value}`; expected a positive integer"
+        if parsed == 0 then
+          throw "job count must be at least 1"
+        go rest jsonl markers? optionSelectors parsed allowPartial internalWorker positionals
+    | "--jobs" :: [] => throw "missing value after `--jobs`"
+    | "--all-markers" :: rest =>
+        go rest jsonl (some Kind.all) optionSelectors jobs allowPartial internalWorker positionals
     | "--markers" :: value :: rest =>
         let selected ← parseMarkers value
-        go rest jsonl (some (markers?.getD #[] ++ selected)) optionSelectors positionals
+        go rest jsonl (some (markers?.getD #[] ++ selected)) optionSelectors jobs allowPartial
+          internalWorker positionals
     | "--markers" :: [] => throw "missing value after `--markers`"
     | "--option" :: value :: rest =>
         let selector ← OptionSelector.parse value
-        go rest jsonl markers? (optionSelectors.push selector) positionals
+        go rest jsonl markers? (optionSelectors.push selector) jobs allowPartial internalWorker
+          positionals
     | "--option" :: [] => throw "missing value after `--option`"
     | arg :: rest =>
         if arg.startsWith "--markers=" then
           let selected ← parseMarkers (arg.drop "--markers=".length).toString
-          go rest jsonl (some (markers?.getD #[] ++ selected)) optionSelectors positionals
+          go rest jsonl (some (markers?.getD #[] ++ selected)) optionSelectors jobs allowPartial
+            internalWorker positionals
         else if arg.startsWith "--option=" then
           let selector ← OptionSelector.parse (arg.drop "--option=".length).toString
-          go rest jsonl markers? (optionSelectors.push selector) positionals
+          go rest jsonl markers? (optionSelectors.push selector) jobs allowPartial internalWorker
+            positionals
+        else if arg.startsWith "--jobs=" then
+          let value := (arg.drop "--jobs=".length).toString
+          let some parsed := value.toNat?
+            | throw s!"invalid job count `{value}`; expected a positive integer"
+          if parsed == 0 then
+            throw "job count must be at least 1"
+          go rest jsonl markers? optionSelectors parsed allowPartial internalWorker positionals
         else if arg.startsWith "-" then
           throw s!"unknown option `{arg}`"
         else
-          go rest jsonl markers? optionSelectors (positionals.push arg)
-  go args false none #[] #[]
+          go rest jsonl markers? optionSelectors jobs allowPartial internalWorker
+            (positionals.push arg)
+  go args false none #[] 1 false false #[]
 
 /-- Load the Lake workspace rooted at the current project. -/
 def loadProjectWorkspace : IO Lake.Workspace := do
@@ -424,37 +461,101 @@ def addProjectLeanSearchPath : IO Unit := do
   catch _ =>
     pure ()
 
-/-- Print elaboration errors and reject a module whose info trees are incomplete. -/
-def ensureNoErrors (moduleName : Name) (messages : MessageLog) : IO Unit := do
-  if messages.hasErrors then
-    for message in messages.toList do
-      if message.severity == .error then
-        IO.eprintln (← message.toString)
-    throw <| IO.userError s!"failed to elaborate module `{moduleName}`"
+/-- The stage at which an isolated module scan failed. -/
+inductive FailurePhase where
+  | sourceResolution
+  | parse
+  | header
+  | elaboration
+  | internal
+  deriving Inhabited, BEq
+
+namespace FailurePhase
+
+/-- Stable machine-readable name for a module failure stage. -/
+def name : FailurePhase → String
+  | .sourceResolution => "source-resolution"
+  | .parse => "parse"
+  | .header => "header"
+  | .elaboration => "elaboration"
+  | .internal => "internal"
+
+end FailurePhase
+
+/-- A failed module scan, including enough context for deterministic structured reporting. -/
+structure ModuleFailure where
+  moduleName : Name
+  phase : FailurePhase
+  diagnostic : String
+  deriving Inhabited
+
+/-- Turn exceptions from one scan phase into an explicit per-module failure. -/
+def captureFailure (moduleName : Name) (phase : FailurePhase) (act : IO α) :
+    IO (Except ModuleFailure α) := do
+  try
+    return .ok (← act)
+  catch e =>
+    return .error { moduleName, phase, diagnostic := toString e }
+
+/-- Render all error diagnostics in a message log, if any. -/
+def errorDiagnostics? (messages : MessageLog) : IO (Option String) := do
+  if !messages.hasErrors then
+    return none
+  let mut diagnostics := #[]
+  for message in messages.toList do
+    if message.severity == .error then
+      diagnostics := diagnostics.push (← message.toString)
+  return some (String.intercalate "\n" diagnostics.toList)
+
+/-- Convert message-log errors from a scan phase into an explicit failure. -/
+def failureFromMessages? (moduleName : Name) (phase : FailurePhase) (messages : MessageLog) :
+    IO (Option ModuleFailure) := do
+  return (← errorDiagnostics? messages).map fun diagnostic => { moduleName, phase, diagnostic }
 
 /-- Return the options Lake uses to build a configured module. -/
 def moduleLeanOptions (workspace : Lake.Workspace) (moduleName : Name) : LeanOptions :=
   (workspace.findTargetModule? moduleName).map (·.leanOptions) |>.getD {}
 
+/-- Elaborate a source module without throwing away its failure phase or diagnostics. -/
+def moduleInfoTreesWithOptionsResult (moduleName : Name) (path : System.FilePath)
+    (leanOptions : LeanOptions) :
+    IO (Except ModuleFailure (FileMap × PersistentArray InfoTree)) := do
+  ExceptT.run do
+    let input ← ExceptT.mk <| captureFailure moduleName .sourceResolution (IO.FS.readFile path)
+    let inputCtx := Parser.mkInputContext input path.toString
+    let (header, parserState, parseMessages) ← ExceptT.mk <|
+      captureFailure moduleName .parse (Parser.parseHeader inputCtx)
+    if let some failure ← ExceptT.lift <|
+        failureFromMessages? moduleName .parse parseMessages then
+      throw failure
+    unsafe Lean.enableInitializersExecution
+    let options := leanOptions.toOptions
+    let (env, headerMessages) ← ExceptT.mk <| captureFailure moduleName .header <|
+      Elab.processHeader header options parseMessages inputCtx
+        (leakEnv := false) (mainModule := moduleName)
+    if let some failure ← ExceptT.lift <|
+        failureFromMessages? moduleName .header headerMessages then
+      throw failure
+    let options ← ExceptT.mk <| captureFailure moduleName .elaboration <|
+      Lean.Language.Lean.reparseOptions options
+    let commandState := Elab.Command.mkState env headerMessages options
+    let state ← ExceptT.mk <| captureFailure moduleName .elaboration <|
+      Elab.IO.processCommands inputCtx parserState commandState
+    if let some failure ← ExceptT.lift <|
+        failureFromMessages? moduleName .elaboration state.commandState.messages then
+      throw failure
+    let infoState := state.commandState.infoState.substituteLazy.get
+    return (inputCtx.fileMap, infoState.trees)
+
 /-- Elaborate a source module with the given Lake options and return its completed info trees. -/
 def moduleInfoTreesWithOptions (moduleName : Name) (path : System.FilePath)
     (leanOptions : LeanOptions) :
     IO (FileMap × PersistentArray InfoTree) := do
-  let input ← IO.FS.readFile path
-  let inputCtx := Parser.mkInputContext input path.toString
-  let (header, parserState, parseMessages) ← Parser.parseHeader inputCtx
-  ensureNoErrors moduleName parseMessages
-  unsafe Lean.enableInitializersExecution
-  let options := leanOptions.toOptions
-  let (env, headerMessages) ← Elab.processHeader header options parseMessages inputCtx
-    (leakEnv := true) (mainModule := moduleName)
-  ensureNoErrors moduleName headerMessages
-  let options ← Lean.Language.Lean.reparseOptions options
-  let commandState := Elab.Command.mkState env headerMessages options
-  let state ← Elab.IO.processCommands inputCtx parserState commandState
-  ensureNoErrors moduleName state.commandState.messages
-  let infoState := state.commandState.infoState.substituteLazy.get
-  return (inputCtx.fileMap, infoState.trees)
+  match ← moduleInfoTreesWithOptionsResult moduleName path leanOptions with
+  | .ok result => return result
+  | .error failure =>
+      throw <| IO.userError
+        s!"{failure.phase.name} failed for module `{failure.moduleName}`: {failure.diagnostic}"
 
 /-- Elaborate a source module with its configured Lake options and return its completed info trees. -/
 def moduleInfoTrees (moduleName : Name) (path : System.FilePath) :
@@ -787,17 +888,40 @@ def lessWithinModule (a b : Finding) : Bool :=
   else
     a.kind.name < b.kind.name
 
+/-- The explicit outcome of scanning one module. -/
+inductive ModuleScanResult where
+  | success (findings : Array Finding)
+  | failure (failure : ModuleFailure)
+  deriving Inhabited
+
+/-- Find enabled technical debt in one module while retaining structured failures. -/
+def findModuleInWorkspaceResult (workspace : Lake.Workspace) (moduleName : Name)
+    (enabledMarkers : Array Kind) (optionSelectors : Array OptionSelector := #[]) :
+    IO ModuleScanResult := do
+  let result ← ExceptT.run do
+    let path ← ExceptT.mk <| captureFailure moduleName .sourceResolution <|
+      resolveModuleSource moduleName
+    let leanOptions := moduleLeanOptions workspace moduleName
+    let (fileMap, trees) ← ExceptT.mk <|
+      moduleInfoTreesWithOptionsResult moduleName path leanOptions
+    ExceptT.mk <| captureFailure moduleName .internal do
+      let mut findings := #[]
+      for tree in trees do
+        findings := collectTree moduleName path.toString fileMap enabledMarkers optionSelectors tree findings
+      return (deduplicate findings).qsort lessWithinModule
+  match result with
+  | .ok findings => return .success findings
+  | .error failure => return .failure failure
+
 /-- Find enabled technical debt in one module using an already loaded Lake workspace. -/
 def findModuleInWorkspace (workspace : Lake.Workspace) (moduleName : Name)
     (enabledMarkers : Array Kind) (optionSelectors : Array OptionSelector := #[]) :
     IO (Array Finding) := do
-  let path ← resolveModuleSource moduleName
-  let leanOptions := moduleLeanOptions workspace moduleName
-  let (fileMap, trees) ← moduleInfoTreesWithOptions moduleName path leanOptions
-  let mut findings := #[]
-  for tree in trees do
-    findings := collectTree moduleName path.toString fileMap enabledMarkers optionSelectors tree findings
-  return (deduplicate findings).qsort lessWithinModule
+  match ← findModuleInWorkspaceResult workspace moduleName enabledMarkers optionSelectors with
+  | .success findings => return findings
+  | .failure failure =>
+      throw <| IO.userError
+        s!"{failure.phase.name} failed for module `{failure.moduleName}`: {failure.diagnostic}"
 
 /-- Sort findings by module and source position for deterministic multi-module output. -/
 def lessForOutput (a b : Finding) : Bool :=
@@ -843,6 +967,7 @@ def formatFinding (finding : Finding) : String :=
 /-- Render a finding as a compact JSON object. -/
 def formatFindingJsonLine (finding : Finding) : String :=
   let fields : List (String × Json) := [
+    ("type", "finding"),
     ("module", toString finding.moduleName),
     ("file", finding.file),
     ("kind", finding.kind.name),
@@ -858,16 +983,154 @@ def formatFindingJsonLine (finding : Finding) : String :=
     | none => fields
   Json.compress <| Json.mkObj fields
 
-/-- Run the `tech-debt` command. -/
-def run (config : Config) : IO Unit := do
+/-- Render a failed module as one compact JSON object. -/
+def formatFailureJsonLine (failure : ModuleFailure) : String :=
+  Json.compress <| Json.mkObj [
+    ("type", "error"),
+    ("module", toString failure.moduleName),
+    ("phase", failure.phase.name),
+    ("diagnostic", failure.diagnostic)]
+
+/-- Render a failed module for the default human-readable error stream. -/
+def formatFailure (failure : ModuleFailure) : String :=
+  s!"error: module `{failure.moduleName}` failed during {failure.phase.name}: {failure.diagnostic}"
+
+/-- Print one completed module outcome and return whether it succeeded. -/
+def printModuleResult (config : Config) (result : ModuleScanResult) : IO Bool := do
+  match result with
+  | .success findings =>
+      for finding in findings do
+        if config.jsonl then
+          IO.println (formatFindingJsonLine finding)
+        else
+          IO.println (formatFinding finding)
+      return true
+  | .failure failure =>
+      if config.jsonl then
+        IO.println (formatFailureJsonLine failure)
+      else
+        IO.eprintln (formatFailure failure)
+      return false
+
+/-- Reconstruct a selector exactly for an isolated child invocation. -/
+def OptionSelector.cliString : OptionSelector → String
+  | .exact optionName => toString optionName
+  | .prefix optionPrefix => s!"{optionPrefix}.*"
+
+/-- Command-line arguments for one isolated module worker. -/
+def isolatedWorkerArgs (config : Config) (moduleName : Name) : Array String := Id.run do
+  let mut args := #["tech-debt", "--internal-worker"]
+  if config.jsonl then
+    args := args.push "--jsonl"
+  if !config.markers.isEmpty then
+    args := args.push "--markers"
+    args := args.push <| String.intercalate "," (config.markers.toList.map Kind.name)
+  for selector in config.optionSelectors do
+    args := args.push "--option"
+    args := args.push selector.cliString
+  args := args.push "module"
+  args := args.push (toString moduleName)
+  return args
+
+/-- Captured output from one child process, kept until deterministic coordinator emission. -/
+structure IsolatedScan where
+  moduleName : Name
+  stdout : String := ""
+  stderr : String := ""
+  succeeded : Bool := false
+  deriving Inhabited
+
+/-- Run one module in a fresh process so all imported environments die with that process. -/
+def scanIsolatedModule (config : Config) (moduleName : Name) : IO IsolatedScan := do
+  try
+    let appPath ← IO.appPath
+    let projectRoot ← Server.findProjectRoot
+    let output ← IO.Process.output {
+      cmd := appPath.toString
+      args := isolatedWorkerArgs config moduleName
+      cwd := some projectRoot
+    }
+    let succeeded := output.exitCode == 0
+    let fallback : ModuleFailure := {
+      moduleName
+      phase := .internal
+      diagnostic := if output.stderr.trimAscii.isEmpty then
+        s!"isolated worker exited with status {output.exitCode}"
+      else
+        output.stderr.trimAscii.toString
+    }
+    let stdout := if !succeeded && config.jsonl && output.stdout.trimAscii.isEmpty then
+      formatFailureJsonLine fallback ++ "\n"
+    else
+      output.stdout
+    let stderr := if !succeeded && !config.jsonl && output.stderr.trimAscii.isEmpty then
+      formatFailure fallback ++ "\n"
+    else
+      output.stderr
+    return { moduleName, stdout, stderr, succeeded }
+  catch e =>
+    let failure : ModuleFailure := { moduleName, phase := .internal, diagnostic := toString e }
+    return {
+      moduleName
+      stdout := if config.jsonl then formatFailureJsonLine failure ++ "\n" else ""
+      stderr := if config.jsonl then "" else formatFailure failure ++ "\n"
+      succeeded := false
+    }
+
+/-- Run isolated module workers in bounded batches while preserving sorted module order. -/
+partial def scanIsolatedModules (config : Config) (moduleNames : List Name) :
+    IO (Array IsolatedScan) := do
+  if moduleNames.isEmpty then
+    return #[]
+  let (batch, rest) := moduleNames.splitAt config.jobs
+  let mut tasks := #[]
+  for moduleName in batch do
+    tasks := tasks.push (← IO.asTask (scanIsolatedModule config moduleName))
+  let mut results := #[]
+  for task in tasks do
+    match ← IO.wait task with
+    | .ok result => results := results.push result
+    | .error e =>
+        -- `scanIsolatedModule` catches its own IO errors, so this indicates a runtime failure.
+        let moduleName := batch[results.size]!
+        let failure : ModuleFailure := { moduleName, phase := .internal, diagnostic := toString e }
+        results := results.push {
+          moduleName
+          stdout := if config.jsonl then formatFailureJsonLine failure ++ "\n" else ""
+          stderr := if config.jsonl then "" else formatFailure failure ++ "\n"
+          succeeded := false
+        }
+  return results ++ (← scanIsolatedModules config rest)
+
+/-- Run the `tech-debt` command and return a status reflecting partial module failures. -/
+def run (config : Config) : IO UInt32 := do
   let workspace ← loadProjectWorkspace
   let moduleNames ← modulesForScope workspace config.scope
-  let findings ←
-    findModulesInWorkspace workspace moduleNames config.markers config.optionSelectors
-  for finding in findings do
-    if config.jsonl then
-      IO.println (formatFindingJsonLine finding)
-    else
-      IO.println (formatFinding finding)
+  if config.internalWorker then
+    match config.scope with
+    | .module moduleName =>
+        addProjectLeanSearchPath
+        let succeeded ← printModuleResult config <|
+          ← findModuleInWorkspaceResult workspace moduleName config.markers config.optionSelectors
+        return if succeeded || config.allowPartial then 0 else 1
+    | .library _ | .package _ =>
+        throw <| IO.userError "internal tech-debt workers require exactly one module"
+  match config.scope with
+  | .module moduleName =>
+      addProjectLeanSearchPath
+      let succeeded ← printModuleResult config <|
+        ← findModuleInWorkspaceResult workspace moduleName config.markers config.optionSelectors
+      return if succeeded || config.allowPartial then 0 else 1
+  | .library _ | .package _ =>
+      let normalized := normalizeModuleNames moduleNames
+      let results ← scanIsolatedModules config normalized.toList
+      let mut succeeded := true
+      for result in results do
+        if !result.stdout.isEmpty then
+          IO.print result.stdout
+        if !result.stderr.isEmpty then
+          IO.eprint result.stderr
+        succeeded := succeeded && result.succeeded
+      return if succeeded || config.allowPartial then 0 else 1
 
 end AFTK.TechDebt
