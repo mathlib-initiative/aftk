@@ -317,56 +317,167 @@ def processMemory? (pid : Nat) : IO (Option ProcessMemory) := do
   catch _ =>
     return none
 
-/-- Parse whitespace-separated process arguments from `ps`. Paths with spaces are not supported. -/
-def processArgs? (pid : Nat) : IO (Option (List String)) := do
+/-- The stable identity and exact argument vector of an operating-system process. -/
+structure ProcessInfo where
+  pid : Nat
+  effectiveUid : Nat
+  startTimeTicks : Nat
+  executable : String
+  argv : List String
+  deriving BEq, Repr
+
+/-- Injectable access to the process table and signaling operation. -/
+structure ProcessInventory where
+  currentUid : IO Nat
+  list : IO (Array ProcessInfo)
+  lookup : Nat → IO (Option ProcessInfo)
+  signal : Nat → String → IO Unit
+
+/-- Split Linux `/proc/<pid>/cmdline` bytes without losing argument boundaries. -/
+def parseNulDelimitedArgv (raw : ByteArray) : Option (List String) := Id.run do
+  let mut argv := []
+  let mut start := 0
+  for i in [:raw.size] do
+    if raw[i]! == 0 then
+      let some arg := String.fromUTF8? (raw.extract start i) | return none
+      argv := argv ++ [arg]
+      start := i + 1
+  if start < raw.size then
+    let some arg := String.fromUTF8? (raw.extract start raw.size) | return none
+    argv := argv ++ [arg]
+  return some argv
+
+/-- Parse the effective UID (the second UID) from Linux `/proc/<pid>/status`. -/
+def parseProcEffectiveUid? (raw : String) : Option Nat := Id.run do
+  for line in raw.splitOn "\n" do
+    if line.startsWith "Uid:" then
+      let fields := (line.replace "\t" " ").splitOn " " |>.filter (!·.isEmpty)
+      return fields[2]?.bind String.toNat?
+  return none
+
+/-- Parse process start time (field 22) from Linux `/proc/<pid>/stat`. -/
+def parseProcStartTime? (raw : String) : Option Nat := do
+  -- The command name in field 2 may contain spaces or `)`, so split after its final `)`.
+  let tail := raw.toList.reverse.takeWhile (· != ')') |>.reverse
+  let fields := (String.ofList tail).trimAscii.toString.splitOn " " |>.filter (!·.isEmpty)
+  fields[19]?.bind String.toNat?
+
+/-- Read one coherent process snapshot from a Linux procfs tree. -/
+def linuxProcessInfoAt? (procRoot : FilePath) (pid : Nat) : IO (Option ProcessInfo) := do
+  let dir := procRoot / toString pid
   try
-    let out ← IO.Process.output { cmd := "ps", args := #["-p", toString pid, "-o", "args="] }
-    if out.exitCode != 0 then
+    -- Read the start time on both sides so PID reuse during the snapshot fails closed.
+    let some startTimeTicks ← pure (parseProcStartTime? (← IO.FS.readFile (dir / "stat")))
+      | return none
+    let some effectiveUid ← pure (parseProcEffectiveUid? (← IO.FS.readFile (dir / "status")))
+      | return none
+    let some argv ← pure (parseNulDelimitedArgv (← IO.FS.readBinFile (dir / "cmdline")))
+      | return none
+    let executable ← IO.FS.realPath (dir / "exe")
+    let some startTimeTicks' ← pure (parseProcStartTime? (← IO.FS.readFile (dir / "stat")))
+      | return none
+    if startTimeTicks != startTimeTicks' then
       return none
-    let mut toks := []
-    for tok in out.stdout.trimAscii.toString.splitOn " " do
-      if !tok.isEmpty then
-        toks := toks ++ [tok]
-    return some toks
-  catch _ => return none
+    return some { pid, effectiveUid, startTimeTicks, executable := executable.toString, argv }
+  catch _ =>
+    return none
+
+/-- Read the current effective UID, preferring procfs and falling back to `id -u`. -/
+def currentEffectiveUid : IO Nat := do
+  try
+    if let some uid := parseProcEffectiveUid? (← IO.FS.readFile "/proc/self/status") then
+      return uid
+  catch _ => pure ()
+  let out ← IO.Process.output { cmd := "id", args := #["-u"] }
+  let some uid := out.stdout.trimAscii.toString.toNat?
+    | throw <| IO.userError "could not determine the current effective UID"
+  return uid
+
+/-- Kill a process by PID using the platform `kill` command (POSIX best effort). -/
+def killPid (pid : Nat) (signal : String) : IO Unit := do
+  let out ← IO.Process.output {
+    cmd := "kill"
+    args := #[s!"-{signal}", toString pid]
+  }
+  if out.exitCode != 0 then
+    throw <| IO.userError out.stderr
+
+/-- Linux process access. A missing procfs fails closed instead of parsing lossy `ps` output. -/
+def systemProcessInventory : ProcessInventory where
+  currentUid := currentEffectiveUid
+  lookup := linuxProcessInfoAt? "/proc"
+  list := do
+    let mut processes := #[]
+    try
+      for entry in (← FilePath.readDir "/proc") do
+        if let some pid := entry.fileName.toNat? then
+          if let some info ← linuxProcessInfoAt? "/proc" pid then
+            processes := processes.push info
+    catch _ => pure ()
+    return processes
+  signal := killPid
+
+/-- Processes in a snapshot owned by the supplied effective UID. -/
+def processesOwnedBy (uid : Nat) (processes : Array ProcessInfo) : Array ProcessInfo :=
+  processes.filter (·.effectiveUid == uid)
+
+/-- Check the full identity captured before a potentially destructive operation. -/
+def processIdentityMatches (expected actual : ProcessInfo) : Bool :=
+  expected == actual
+
+/-- Revalidate ownership and identity immediately before signaling a process. -/
+def signalIfUnchanged (inventory : ProcessInventory) (expected : ProcessInfo)
+    (signal : String) : IO Bool := do
+  let uid ← inventory.currentUid
+  if expected.effectiveUid != uid then
+    return false
+  let some actual ← inventory.lookup expected.pid | return false
+  if actual.effectiveUid != uid || !processIdentityMatches expected actual then
+    return false
+  inventory.signal expected.pid signal
+  return true
+
+/-- True when a path names an executable with the supplied basename. -/
+def executableNamed (name path : String) : Bool :=
+  path == name || path.endsWith ("/" ++ name) || path.endsWith ("\\" ++ name ++ ".exe")
 
 /-- Recognize the exact Lean file-worker command shape. -/
 def isLeanWorkerArgs : List String → Bool
-  | exe :: ["--worker"] => exe == "lean" || exe.endsWith "/lean" || exe.endsWith "/lean.exe"
+  | exe :: ["--worker"] => executableNamed "lean" exe || exe.endsWith "/lean.exe"
   | _ => false
 
-/-- Best-effort list of all Lean worker PIDs owned by this user/session. -/
-def leanWorkerPids : IO (Array Nat) := do
-  try
-    let out ← IO.Process.output { cmd := "pgrep", args := #["-f", "lean --worker"] }
-    if out.exitCode != 0 then
-      return #[]
-    let mut pids := #[]
-    for line in out.stdout.splitOn "\n" do
-      if let some pid := line.trimAscii.toString.toNat? then
-        if let some args ← processArgs? pid then
-          if isLeanWorkerArgs args then
-            pids := pids.push pid
-    return pids
-  catch _ =>
-    return #[]
+/-- Recognize a real Lean executable with the exact file-worker argument shape. -/
+def isLeanWorkerProcess (info : ProcessInfo) : Bool :=
+  executableNamed "lean" info.executable && isLeanWorkerArgs info.argv
 
-/-- Sum memory for all currently visible Lean workers. -/
-def leanWorkersMemory : IO (Nat × ProcessMemory) := do
-  let pids ← leanWorkerPids
-  let mut count := 0
+/-- List Lean worker PIDs from an injectable, effective-UID-scoped process inventory. -/
+def leanWorkerPidsUsing (inventory : ProcessInventory) : IO (Array Nat) := do
+  let uid ← inventory.currentUid
+  return processesOwnedBy uid (← inventory.list) |>.filter isLeanWorkerProcess |>.map (·.pid)
+
+/-- Best-effort list of all Lean worker PIDs owned by the current effective user. -/
+def leanWorkerPids : IO (Array Nat) :=
+  leanWorkerPidsUsing systemProcessInventory
+
+/-- Sum memory for effective-UID-scoped workers using injectable process data. -/
+def leanWorkersMemoryUsing (inventory : ProcessInventory)
+    (memoryFor : Nat → IO (Option ProcessMemory)) : IO (Nat × ProcessMemory) := do
+  let pids ← leanWorkerPidsUsing inventory
   let mut rss := 0
   let mut pss := 0
   let mut privateKb := 0
   let mut swap := 0
   for pid in pids do
-    if let some mem ← processMemory? pid then
-      count := count + 1
+    if let some mem ← memoryFor pid then
       rss := rss + mem.rssKb
       pss := pss + mem.pssKb
       privateKb := privateKb + mem.privateKb
       swap := swap + mem.swapKb
-  return (count, { rssKb := rss, pssKb := pss, privateKb, swapKb := swap })
+  return (pids.size, { rssKb := rss, pssKb := pss, privateKb, swapKb := swap })
+
+/-- Sum memory for all Lean workers owned by the current effective user. -/
+def leanWorkersMemory : IO (Nat × ProcessMemory) :=
+  leanWorkersMemoryUsing systemProcessInventory processMemory?
 
 /-- Parse a dependency build mode option. -/
 def parseBuildMode (s : String) : Except String DependencyBuildMode :=
@@ -1831,21 +1942,38 @@ def getDaemon (root : FilePath) (startIfMissing : Bool) : IO (Option ServerMeta)
       -- Last-resort retry without holding the lock; this should be rare and bounded by metadata checks.
       return some (← startDaemon root)
 
-/-- Kill a process by PID using the platform `kill` command (POSIX best effort). -/
-def killPid (pid : Nat) (signal : String) : IO Unit := do
-  let out ← IO.Process.output {
-    cmd := "kill"
-    args := #[s!"-{signal}", toString pid]
-  }
-  if out.exitCode != 0 then
-    throw <| IO.userError out.stderr
+/-- Parse the exact argument shape used to launch an AFTK daemon. -/
+def aftkDaemonArgs? : List String → Option (String × String)
+  | exe :: ["daemon", "--project-root", root, "--token", token] =>
+      if executableNamed "aftk" exe || exe.endsWith "/aftk.exe" then some (root, token) else none
+  | _ => none
+
+/-- Recognize an actual AFTK executable with the exact daemon command shape. -/
+def aftkDaemonProcess? (info : ProcessInfo) : Option (String × String) := do
+  if !executableNamed "aftk" info.executable then none
+  aftkDaemonArgs? info.argv
+
+/-- Check a daemon process against metadata-derived root and startup token. -/
+def isAftkDaemonProcessFor (info : ProcessInfo) (root token : String) : Bool :=
+  aftkDaemonProcess? info == some (root, token)
 
 /-- Force shutdown using metadata when graceful shutdown failed. -/
 def forceShutdown (root : FilePath) : IO Json := do
   if !(← (metaPath root).pathExists) then
     return Json.mkObj [("status", "notRunning")]
   let md ← readMeta root
-  try killPid md.pid "TERM" catch _ => pure ()
+  let inventory := systemProcessInventory
+  let expected? ← inventory.lookup md.pid
+  let some expected := expected? | do
+    removeFileIfExists (metaPath root)
+    removeDirIfExists (lockPath root)
+    return Json.mkObj [("status", "staleMetadata"), ("pid", md.pid)]
+  let expectedDaemon := isAftkDaemonProcessFor expected md.projectRoot md.token
+  if !expectedDaemon || expected.effectiveUid != (← inventory.currentUid) then
+    removeFileIfExists (metaPath root)
+    removeDirIfExists (lockPath root)
+    return Json.mkObj [("status", "staleMetadata"), ("pid", md.pid)]
+  try discard <| signalIfUnchanged inventory expected "TERM" catch _ => pure ()
   IO.sleep 500
   -- If still reachable, escalate.
   let stillRunning ← try
@@ -1853,66 +1981,46 @@ def forceShutdown (root : FilePath) : IO Json := do
     pure true
   catch _ => pure false
   if stillRunning then
-    try killPid md.pid "KILL" catch _ => pure ()
+    try discard <| signalIfUnchanged inventory expected "KILL" catch _ => pure ()
   removeFileIfExists (metaPath root)
   removeDirIfExists (lockPath root)
   return Json.mkObj [("status", "forced"), ("pid", md.pid)]
 
-/-- Return the argument following `flag`. -/
-def argAfter? (flag : String) : List String → Option String
-  | [] => none
-  | x :: y :: rest => if x == flag then some y else argAfter? flag (y :: rest)
-  | _ :: rest => argAfter? flag rest
+/-- List exact AFTK daemon processes owned by the current effective user. -/
+def aftkDaemonProcessesUsing (inventory : ProcessInventory) : IO (Array ProcessInfo) := do
+  let uid ← inventory.currentUid
+  return processesOwnedBy uid (← inventory.list) |>.filter (aftkDaemonProcess? · |>.isSome)
 
-/-- Best-effort list of AFTK daemon PIDs. -/
+/-- Best-effort list of current-user AFTK daemon PIDs. -/
 def aftkDaemonPids : IO (Array Nat) := do
-  try
-    let out ← IO.Process.output { cmd := "pgrep", args := #["-f", "aftk daemon --project-root"] }
-    if out.exitCode != 0 then
-      return #[]
-    let mut pids := #[]
-    for line in out.stdout.splitOn "\n" do
-      if let some pid := line.trimAscii.toString.toNat? then
-        pids := pids.push pid
-    return pids
-  catch _ => return #[]
-
-/-- Recognize the exact daemon command shape. -/
-def isAftkDaemonArgs : List String → Bool
-  | _exe :: "daemon" :: _ => true
-  | _ => false
+  return (← aftkDaemonProcessesUsing systemProcessInventory).map (·.pid)
 
 /-- Gracefully shut down every discoverable AFTK project daemon for this user. -/
 def shutdownAllDaemons : IO Json := do
-  let pids ← aftkDaemonPids
+  let inventory := systemProcessInventory
+  let processes ← aftkDaemonProcessesUsing inventory
   let mut arr := #[]
-  for pid in pids do
-    let args? ← processArgs? pid
-    match args? with
-    | none => arr := arr.push <| Json.mkObj [("pid", pid), ("status", "unknownArgs")]
-    | some args =>
-      if !isAftkDaemonArgs args then
-        pure ()
-      else
-      match argAfter? "--project-root" args with
-      | none =>
-          arr := arr.push <| Json.mkObj [("pid", pid), ("status", "unknownProjectRoot")]
-      | some rootString =>
+  for process in processes do
+    if let some (rootString, token) := aftkDaemonProcess? process then
         let root := FilePath.mk rootString
         let result ← try
           if ← (metaPath root).pathExists then
             let md ← readMeta root
-            let resp ← sendToDaemon md "shutdown" (Json.mkObj []) 5000
-            removeFileIfExists (metaPath root)
-            removeDirIfExists (lockPath root)
-            pure resp
+            if md.pid == process.pid && md.projectRoot == rootString && md.token == token then
+              let resp ← sendToDaemon md "shutdown" (Json.mkObj []) 5000
+              removeFileIfExists (metaPath root)
+              removeDirIfExists (lockPath root)
+              pure resp
+            else
+              discard <| signalIfUnchanged inventory process "TERM"
+              pure <| errorResponse "staleMetadata" "daemon metadata does not match process identity"
           else
-            try killPid pid "TERM" catch _ => pure ()
-            pure <| okResponse (Json.mkObj [("status", "signaled")])
+            let signaled ← signalIfUnchanged inventory process "TERM"
+            pure <| okResponse (Json.mkObj [("status", if signaled then "signaled" else "identityChanged")])
         catch e =>
-          try killPid pid "TERM" catch _ => pure ()
+          try discard <| signalIfUnchanged inventory process "TERM" catch _ => pure ()
           pure <| errorResponse "ioError" e.toString
-        arr := arr.push <| Json.mkObj [("pid", pid), ("projectRoot", rootString), ("response", result)]
+        arr := arr.push <| Json.mkObj [("pid", process.pid), ("projectRoot", rootString), ("response", result)]
   return Json.mkObj [("status", "ok"), ("daemons", Json.arr arr)]
 
 /-- Print JSON result to stdout. -/
@@ -1944,7 +2052,8 @@ Commands:
   close --all                    Close all non-busy workers.
   gc [--aggressive]              Run daemon resource cleanup now.
   status [--start]               Show daemon/resource status for the current project.
-  shutdown [--force|--all-projects] Stop project daemon(s) and workers.
+  shutdown [--force|--all-projects] Stop project daemon(s) and workers; --all-projects is
+                                scoped to the current effective user.
 
 Options:
   --timeout-ms <n>               Diagnostics/request timeout.

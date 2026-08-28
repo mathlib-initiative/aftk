@@ -79,15 +79,15 @@ Resource management is built in for multi-agent use:
 | Environment variable | Default | Meaning |
 |---|---:|---|
 | `AFTK_MAX_WORKERS_PER_PROJECT` | `8` | Per-project worker cap; LRU non-busy workers are evicted before opening more. |
-| `AFTK_GLOBAL_MAX_WORKERS` | `50` | Global cap on visible `lean --worker` processes; new opens are rejected if local eviction cannot get under the cap. |
+| `AFTK_GLOBAL_MAX_WORKERS` | `50` | Global cap on this effective user's `lean --worker` processes; new opens are rejected if local eviction cannot get under the cap. |
 | `AFTK_WORKER_IDLE_MS` | `600000` | Idle-worker TTL before automatic close. |
 | `AFTK_DAEMON_IDLE_MS` | `300000` | Empty daemon TTL before automatic exit. |
 | `AFTK_DEFAULT_LEASE_MS` | unset | Default lease for workers opened without `--ttl-ms`. |
-| `AFTK_MEMORY_SOFT_LIMIT_MIB/GIB` | unset | Soft global Lean-worker PSS cap; local LRU workers are evicted opportunistically. |
-| `AFTK_MEMORY_HARD_LIMIT_MIB/GIB` | unset | Hard global Lean-worker PSS cap; new opens are rejected if over budget. |
+| `AFTK_MEMORY_SOFT_LIMIT_MIB/GIB` | unset | Soft PSS cap across this effective user's Lean workers; local LRU workers are evicted opportunistically. |
+| `AFTK_MEMORY_HARD_LIMIT_MIB/GIB` | unset | Hard PSS cap across this effective user's Lean workers; new opens are rejected if over budget. |
 | `AFTK_WORKER_MEMORY_ESTIMATE_MIB` | `6500` | Estimated memory cost of a new Mathlib-heavy worker for hard-limit checks. |
 
-`status` reports worker count, lease metadata, per-worker RSS/PSS, daemon memory, and global Lean-worker memory. `gc` closes expired/idle workers now; `close --all` closes all non-busy workers. `shutdown` stops the project daemon and all workers; `shutdown --all-projects` stops all discoverable AFTK daemons for the current user. Daemon metadata is stored in `.lake/aftk/server.json`.
+`status` reports worker count, lease metadata, per-worker RSS/PSS, daemon memory, and effective-user-wide Lean-worker memory. `gc` closes expired/idle workers now; `close --all` closes all non-busy workers. `shutdown` stops the project daemon and all workers; `shutdown --all-projects` stops all discoverable AFTK daemons owned by the current effective user. Daemon metadata is stored in `.lake/aftk/server.json`.
 
 Run `lake exe aftk --help` or `lake exe aftk <command> --help` for full help.
 

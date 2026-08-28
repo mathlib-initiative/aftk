@@ -9,8 +9,12 @@ AFTK_BIN=${AFTK_BIN:-"$ROOT/.lake/build/bin/aftk"}
 TOOLCHAIN="$ROOT/lean-toolchain"
 
 temps=()
+processes=()
 cleanup() {
   local ec=$?
+  for pid in "${processes[@]:-}"; do
+    kill "$pid" >/dev/null 2>&1 || true
+  done
   for d in "${temps[@]:-}"; do
     if [[ -d "$d" ]]; then
       (cd "$d" && "$AFTK_BIN" shutdown --force >/dev/null 2>&1 || true)
@@ -56,13 +60,19 @@ PY
 
 exact_lean_worker_count() {
   python3 - <<'PY'
-import subprocess
-out = subprocess.run(['pgrep', '-f', 'lean --worker'], text=True, stdout=subprocess.PIPE).stdout.splitlines()
+import glob, os
 count = 0
-for pid in out:
-    ps = subprocess.run(['ps', '-p', pid, '-o', 'args='], text=True, stdout=subprocess.PIPE).stdout.strip().split()
-    if len(ps) == 2 and ps[1] == '--worker' and (ps[0] == 'lean' or ps[0].endswith('/lean') or ps[0].endswith('/lean.exe')):
+for proc in glob.glob('/proc/[0-9]*'):
+  try:
+    status = open(proc + '/status').read().splitlines()
+    uid = int(next(line for line in status if line.startswith('Uid:')).split()[2])
+    argv = open(proc + '/cmdline', 'rb').read().rstrip(b'\0').split(b'\0')
+    exe = os.path.basename(os.readlink(proc + '/exe'))
+    if uid == os.geteuid() and exe == 'lean' and len(argv) == 2 \
+        and os.path.basename(argv[0].decode()) in ('lean', 'lean.exe') and argv[1] == b'--worker':
         count += 1
+  except (OSError, StopIteration, ValueError, UnicodeDecodeError):
+    pass
 print(count)
 PY
 }
@@ -70,16 +80,21 @@ PY
 daemon_count_for_root() {
   local root=$1
   python3 - "$root" <<'PY'
-import subprocess, sys
+import glob, os, sys
 root = sys.argv[1]
-out = subprocess.run(['pgrep', '-f', 'aftk daemon --project-root'], text=True, stdout=subprocess.PIPE).stdout.splitlines()
 count = 0
-for pid in out:
-    ps = subprocess.run(['ps', '-p', pid, '-o', 'args='], text=True, stdout=subprocess.PIPE).stdout.strip().split()
-    if len(ps) >= 4 and ps[1] == 'daemon' and '--project-root' in ps:
-        i = ps.index('--project-root')
-        if i + 1 < len(ps) and ps[i + 1] == root:
-            count += 1
+for proc in glob.glob('/proc/[0-9]*'):
+  try:
+    status = open(proc + '/status').read().splitlines()
+    uid = int(next(line for line in status if line.startswith('Uid:')).split()[2])
+    argv = [arg.decode() for arg in open(proc + '/cmdline', 'rb').read().rstrip(b'\0').split(b'\0')]
+    exe = os.path.basename(os.readlink(proc + '/exe'))
+    if uid == os.geteuid() and exe == 'aftk' and len(argv) == 6 \
+        and os.path.basename(argv[0]) in ('aftk', 'aftk.exe') \
+        and argv[1:4] == ['daemon', '--project-root', root] and argv[4] == '--token':
+      count += 1
+  except (OSError, StopIteration, ValueError, UnicodeDecodeError):
+    pass
 print(count)
 PY
 }
@@ -394,16 +409,67 @@ set -e
 grep -q 'unknown open option' "$p/open.err"
 (cd "$p" && "$AFTK_BIN" shutdown --force >/dev/null || true)
 
-if [[ "${AFTK_TEST_ALL_PROJECTS:-0}" == "1" ]]; then
-  printf 'test: shutdown --all-projects (opt-in; may stop unrelated AFTK daemons)\n'
-  p1=$(make_project)
-  p2=$(make_project)
-  echo 'def x : Nat := 1' > "$p1/Tmp.lean"
-  echo 'def y : Nat := 2' > "$p2/Tmp.lean"
-  (cd "$p1" && "$AFTK_BIN" open Tmp.lean >/dev/null)
-  (cd "$p2" && "$AFTK_BIN" open Tmp.lean >/dev/null)
-  (cd "$p1" && "$AFTK_BIN" shutdown --all-projects > shutdown-all.json)
-  assert_json "$p1/shutdown-all.json" 'assert data["ok"]; assert data["result"]["status"] == "ok"; assert len(data["result"]["daemons"]) >= 2'
-fi
+printf 'test: shutdown --all-projects handles spaces, fallback signaling, and lookalikes\n'
+space_parent=$(mktemp -d /tmp/aftk-test-space-XXXXXX)
+temps+=("$space_parent")
+p1="$space_parent/My Project"
+mkdir -p "$p1/Tmp"
+cat > "$p1/lakefile.toml" <<'EOF'
+name = "tmp"
+version = "0.1.0"
+defaultTargets = ["Tmp"]
+[[lean_lib]]
+name = "Tmp"
+EOF
+cp "$TOOLCHAIN" "$p1/lean-toolchain"
+p2=$(make_project)
+temps+=("$p2")
+(cd "$p1" && "$AFTK_BIN" status --start >/dev/null)
+(cd "$p2" && "$AFTK_BIN" status --start >/dev/null)
+[[ "$(daemon_count_for_root "$p1")" == "1" ]]
+[[ "$(daemon_count_for_root "$p2")" == "1" ]]
+# Force the second daemon through the carefully revalidated signal fallback.
+rm "$p2/.lake/aftk/server.json"
+python3 -c 'import time; time.sleep(120)' aftk daemon --project-root /tmp/unrelated --token fake &
+lookalike_pid=$!
+processes+=("$lookalike_pid")
+p3=$(make_project)
+temps+=("$p3")
+mkdir -p "$p3/.lake/aftk"
+python3 - "$p3" "$lookalike_pid" <<'PY'
+import json, os, sys
+root, pid = sys.argv[1], int(sys.argv[2])
+with open(os.path.join(root, '.lake/aftk/server.json'), 'w') as f:
+  json.dump({
+    'protocolVersion': 4, 'projectRoot': root, 'pid': pid, 'host': '127.0.0.1',
+    'port': 1, 'token': 'stale', 'startedAtMs': 0, 'lastSeenMs': 0, 'toolchain': ''
+  }, f)
+PY
+(cd "$p3" && "$AFTK_BIN" shutdown --force > force-stale.json)
+assert_json "$p3/force-stale.json" '
+assert data["ok"]
+assert data["result"]["status"] == "staleMetadata"
+'
+[[ ! -e "$p3/.lake/aftk/server.json" ]]
+kill -0 "$lookalike_pid"
+(cd "$p1" && "$AFTK_BIN" shutdown --all-projects > shutdown-all.json)
+assert_json "$p1/shutdown-all.json" '
+assert data["ok"]
+r = data["result"]
+assert r["status"] == "ok"
+roots = {d["projectRoot"]: d["response"] for d in r["daemons"]}
+assert data["result"]["daemons"]
+assert len([root for root in roots if root.endswith("My Project")]) == 1
+assert any(resp.get("result", {}).get("status") == "signaled" for resp in roots.values())
+'
+kill -0 "$lookalike_pid"
+for _ in $(seq 1 30); do
+  if [[ "$(daemon_count_for_root "$p1")" == "0" && "$(daemon_count_for_root "$p2")" == "0" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+[[ "$(daemon_count_for_root "$p1")" == "0" ]]
+[[ "$(daemon_count_for_root "$p2")" == "0" ]]
 
 printf 'all server tests passed\n'
