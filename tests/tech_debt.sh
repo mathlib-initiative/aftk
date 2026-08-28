@@ -86,10 +86,13 @@ public register_option linter.style.longFile : Nat := { defValue := 1000, descr 
 public register_option techDebtTest.required : Bool := { defValue := false, descr := "test option" }
 
 open Lean
+open Lean.Parser.Tactic.Conv
 
 elab "#require_option " optionName:ident : command => do
   unless (← getOptions).getBool optionName.getId false do
     throwError "required Lake option `{optionName.getId}` was not applied"
+
+macro "conv_lhs" " => " convTac:conv : tactic => `(tactic| conv => lhs; $convTac)
 
 public section
 
@@ -221,6 +224,16 @@ axiom axiomMarker : True
 theorem erwMarker (a b : Nat) (h : a = b) : a = b := by
   erw [h]
 
+theorem convErwMarker (a b : Nat) (h : a = b) : a + 0 = b := by
+  conv_lhs => erw [Nat.add_zero]
+  exact h
+
+theorem multilineConvErwMarker (a b : Nat) (h : a = b) : a + 0 = b := by
+  conv =>
+    lhs
+    erw [Nat.add_zero]
+  exact h
+
 -- Marker syntax inside quotations is data, not technical debt in this module.
 macro "quoted_axiom" : command => `(command| axiom quoted : True)
 macro "quoted_deprecated" : command => `(command| @[deprecated] def quoted : Nat := 0)
@@ -340,6 +353,25 @@ assert [(finding["range"]["start"]["line"], finding["kind"]) for finding in find
     (78, "deprecated"),
     (81, "axiom"),
     (84, "erw"),
+    (87, "erw"),
+    (93, "erw"),
+], findings
+PY
+
+printf 'test: tech-debt finds tactic- and conv-mode core erw syntax\n'
+(cd "$PROJECT" && lake exe aftk tech-debt --jsonl --markers erw \
+  module TechDebtTest.Markers > erw-markers.jsonl)
+python3 - "$PROJECT/erw-markers.jsonl" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    findings = [json.loads(line) for line in stream if line.strip()]
+
+assert [(finding["range"]["start"]["line"], finding["kind"]) for finding in findings] == [
+    (84, "erw"),
+    (87, "erw"),
+    (93, "erw"),
 ], findings
 PY
 
@@ -371,6 +403,8 @@ assert [(finding["range"]["start"]["line"], finding["kind"]) for finding in find
     (71, "sorry"),
     (74, "sorry"),
     (84, "erw"),
+    (87, "erw"),
+    (93, "erw"),
 ], findings
 PY
 
@@ -416,6 +450,8 @@ assert [(finding["module"], finding["kind"]) for finding in findings] == [
     ("TechDebtTest.Markers", "maxHeartbeats"),
     ("TechDebtTest.Markers", "maxHeartbeats"),
     ("TechDebtTest.Markers", "erw"),
+    ("TechDebtTest.Markers", "erw"),
+    ("TechDebtTest.Markers", "erw"),
 ], findings
 PY
 
@@ -437,6 +473,8 @@ assert [(finding["module"], finding["kind"]) for finding in findings] == [
     ("TechDebtTest.Example", "maxHeartbeats"),
     ("TechDebtTest.Markers", "maxHeartbeats"),
     ("TechDebtTest.Markers", "maxHeartbeats"),
+    ("TechDebtTest.Markers", "erw"),
+    ("TechDebtTest.Markers", "erw"),
     ("TechDebtTest.Markers", "erw"),
 ], findings
 assert all(finding["module"] != "Orphan" for finding in findings)
