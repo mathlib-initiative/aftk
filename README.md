@@ -48,6 +48,23 @@ lake exe aftk deps Mathlib.Data.Nat.Basic Nat.gcd --module 'Mathlib.Algebra.*'
 lake exe aftk rdeps Mathlib.Data.Nat.Basic Nat.gcd --modules 'Mathlib.Algebra.*,Mathlib.Order.*'
 ```
 
+The first positional module is the import scope used to build the dependency graph. To query a
+private declaration from one of its imported submodules without shrinking that scope, pass the
+defining module separately:
+
+```bash
+lake exe aftk rdeps Root Namespace.privateLemma --defined-in Defining.Submodule
+```
+
+This makes a result row's `<module>` and `<declaration>` fields directly reusable as
+`--defined-in <module>` and `<declaration>`. Use `--resolve-suffix` for explicit component-wise
+suffix discovery; a unique match is queried, while ambiguous matches fail with sorted candidates.
+Failed exact lookups also suggest up to 20 candidates without selecting one.
+
+JSONL result rows preserve `module` and `declaration` and add `definingModule`, `scopeModule`, and
+a structured `target`. Lookup failures are emitted as a JSONL `error` record with a stable code,
+the requested target, candidate count, truncation flag, and structured candidates.
+
 ## File diagnostics daemon
 
 `diagnostics` starts an invisible daemon for the current Lake project root if needed, auto-opens the file if needed, sends file changes to a persistent Lean worker, waits for Lean diagnostics, and prints one JSON response object.

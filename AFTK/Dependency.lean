@@ -107,14 +107,13 @@ end ModuleFilter
 structure QueryConfig where
   moduleString : String
   declString : String
+  /-- Module that defined the target, independent of the module imported as the query scope. -/
+  definedIn? : Option String := none
+  /-- Resolve the declaration argument as a component-wise suffix instead of an exact name. -/
+  resolveSuffix : Bool := false
   filter : ModuleFilter := {}
   jsonl : Bool := false
   deriving Inhabited
-
-/-- Convert an `Except String` into an `IO` action. -/
-def exceptToIO : Except String α → IO α
-  | .ok a => pure a
-  | .error msg => throw <| IO.userError msg
 
 /-- Parse a comma-separated list of module patterns. -/
 def parsePatternList (raw : String) : Except String (Array ModulePattern) := do
@@ -133,13 +132,16 @@ def isModuleFilterOption (arg : String) : Bool :=
 
 /-- Parse query subcommand arguments.  `none` means the user requested command help. -/
 partial def parseQueryArgsAux
-    (args : List String) (positionals : Array String) (patterns : Array ModulePattern) (jsonl : Bool) : Except String (Option QueryConfig) := do
+    (args : List String) (positionals : Array String) (patterns : Array ModulePattern)
+    (definedIn? : Option String) (resolveSuffix jsonl : Bool) : Except String (Option QueryConfig) := do
   match args with
   | [] =>
       if positionals.size == 2 then
         return some {
           moduleString := positionals[0]!
           declString := positionals[1]!
+          definedIn? := definedIn?
+          resolveSuffix := resolveSuffix
           filter := { patterns := patterns }
           jsonl := jsonl
         }
@@ -151,36 +153,57 @@ partial def parseQueryArgsAux
       if arg == "--help" || arg == "-h" || (arg == "help" && positionals.isEmpty && rest.isEmpty) then
         return none
       else if arg == "--jsonl" then
-        parseQueryArgsAux rest positionals patterns true
+        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix true
+      else if arg == "--resolve-suffix" then
+        parseQueryArgsAux rest positionals patterns definedIn? true jsonl
+      else if arg == "--defined-in" then
+        match rest with
+        | [] => throw "missing value after `--defined-in`"
+        | value :: rest =>
+            if definedIn?.isSome then
+              throw "`--defined-in` may only be specified once"
+            else if value.trimAscii.isEmpty then
+              throw "empty module name after `--defined-in`"
+            else
+              parseQueryArgsAux rest positionals patterns (some value) resolveSuffix jsonl
+      else if arg.startsWith "--defined-in=" then
+        if definedIn?.isSome then
+          throw "`--defined-in` may only be specified once"
+        else
+          let value := (arg.drop "--defined-in=".length).toString
+          if value.trimAscii.isEmpty then
+            throw "empty module name after `--defined-in=`"
+          else
+            parseQueryArgsAux rest positionals patterns (some value) resolveSuffix jsonl
       else if isModuleFilterOption arg then
         match rest with
         | [] => throw s!"missing value after `{arg}`"
         | value :: rest =>
             let patterns ← addPatternList patterns value
-            parseQueryArgsAux rest positionals patterns jsonl
+            parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl
       else if arg.startsWith "--module=" then
         let patterns ← addPatternList patterns ((arg.drop "--module=".length).toString)
-        parseQueryArgsAux rest positionals patterns jsonl
+        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl
       else if arg.startsWith "--modules=" then
         let patterns ← addPatternList patterns ((arg.drop "--modules=".length).toString)
-        parseQueryArgsAux rest positionals patterns jsonl
+        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl
       else if arg.startsWith "--in=" then
         let patterns ← addPatternList patterns ((arg.drop "--in=".length).toString)
-        parseQueryArgsAux rest positionals patterns jsonl
+        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl
       else if arg.startsWith "--only-module=" then
         let patterns ← addPatternList patterns ((arg.drop "--only-module=".length).toString)
-        parseQueryArgsAux rest positionals patterns jsonl
+        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl
       else if arg.startsWith "-m=" then
         let patterns ← addPatternList patterns ((arg.drop "-m=".length).toString)
-        parseQueryArgsAux rest positionals patterns jsonl
+        parseQueryArgsAux rest positionals patterns definedIn? resolveSuffix jsonl
       else if arg.startsWith "-" then
         throw s!"unknown option `{arg}`"
       else
-        parseQueryArgsAux rest (positionals.push arg) patterns jsonl
+        parseQueryArgsAux rest (positionals.push arg) patterns definedIn? resolveSuffix jsonl
 
 /-- Parse query subcommand arguments.  `none` means the user requested command help. -/
 def parseQueryArgs (args : List String) : Except String (Option QueryConfig) :=
-  parseQueryArgsAux args #[] #[] false
+  parseQueryArgsAux args #[] #[] none false false
 
 /-- Top-level CLI help text. -/
 def topLevelHelp : String :=
@@ -270,17 +293,28 @@ Aliases:
 
 Arguments:
   <module>       Lean module to import before running the query, e.g. Mathlib.Data.Nat.Basic.
-  <declaration>  Declaration to query, e.g. Nat.gcd.  Private declarations are resolved
-                 using <module>'s private namespace.
+  <declaration>  Declaration to query, e.g. Nat.gcd.
 
 {moduleFilterHelp}
 
+Target resolution:
+      --defined-in <module>  Require the target to have been defined in this module.  This is
+                             separate from the imported <module> query scope and makes private
+                             declaration targets round-trippable.
+      --resolve-suffix       Match <declaration> as a whole-name-component suffix.  A unique
+                             match is accepted; ambiguity is reported with sorted candidates.
+
+An exact lookup that fails also reports up to 20 suffix candidates without selecting one.
+
 Output:
   By default, tab-separated rows: <module>\\t<declaration>.
-  With --jsonl, each row is a JSON object with `module` and `declaration` fields.
+  With --jsonl, rows additionally expose `definingModule` and the resolved query `target`.
+  Lookup failures under --jsonl are structured error records with bounded `candidates`.
 
 Examples:
   lake exe aftk {kind.command} Mathlib.Data.Nat.Basic Nat.gcd
+  lake exe aftk {kind.command} Root Namespace.privateLemma --defined-in Defining.Submodule
+  lake exe aftk {kind.command} Root privateLemma --resolve-suffix
   lake exe aftk {kind.command} Mathlib.Data.Nat.Basic Nat.gcd --module 'Mathlib.Algebra.*'
   lake exe aftk {kind.command} Mathlib.Data.Nat.Basic Nat.gcd --modules 'Mathlib.Algebra.*,Mathlib.Order.*'"
 
@@ -526,23 +560,148 @@ module counts because Mathlib modules vary greatly in size.
 def useReverseScanForFilteredRdeps (outputConstCount relevantConstCount : Nat) : Bool :=
   relevantConstCount <= outputConstCount * 4
 
-/--
-Resolve a user-facing declaration name in the environment of `moduleName`.
+/-- A declaration's internal identity plus its stable, user-facing target components. -/
+structure ResolvedDeclaration where
+  name : Name
+  definingModule : Name
+  declaration : Name
+  deriving Inhabited, BEq
 
-Public names are global, so we accept any public declaration available after importing
-`moduleName`.  For private declarations, Lean encodes the declaring module in the name, so we use
-`moduleName` to construct the private candidate.
+/-- A bounded resolution failure suitable for both human-readable and JSON output. -/
+structure ResolutionFailure where
+  code : String
+  message : String
+  candidates : Array ResolvedDeclaration := #[]
+  totalCandidates : Nat := candidates.size
+
+/-- Maximum number of declaration candidates included in one error. -/
+def resolutionCandidateLimit : Nat := 20
+
+/-- Recover the user-facing target components for an environment name. -/
+def resolvedDeclaration (env : Environment) (declName : Name) : ResolvedDeclaration :=
+  {
+    name := declName
+    definingModule := moduleOfD env declName
+    declaration := privateToUserName declName
+  }
+
+/-- All imported declarations, retaining internal names solely for graph traversal. -/
+def declarationIndex (env : Environment) : Array ResolvedDeclaration := Id.run do
+  let mut declarations := #[]
+  for _h : idx in [0:env.header.modules.size] do
+    let definingModule := env.header.modules[idx].module
+    for info in env.header.moduleData[idx]!.constants do
+      declarations := declarations.push {
+        name := info.name
+        definingModule := definingModule
+        declaration := privateToUserName info.name
+      }
+  return declarations
+
+/-- Sort targets by defining module, user-facing name, then internal identity for determinism. -/
+def lessResolvedDeclaration (a b : ResolvedDeclaration) : Bool :=
+  match Name.cmp a.definingModule b.definingModule with
+  | .lt => true
+  | .gt => false
+  | .eq =>
+    match Name.cmp a.declaration b.declaration with
+    | .lt => true
+    | .gt => false
+    | .eq => Name.cmp a.name b.name == .lt
+
+/-- Sort and cap candidates while recording the total number of matches. -/
+def resolutionFailure (code message : String) (candidates : Array ResolvedDeclaration) : ResolutionFailure :=
+  let sorted := candidates.qsort lessResolvedDeclaration
+  {
+    code := code
+    message := message
+    candidates := sorted.take resolutionCandidateLimit
+    totalCandidates := sorted.size
+  }
+
+/-- Declarations that are safe to suggest and whose user-facing name has the requested suffix. -/
+def suffixCandidates
+    (env : Environment) (index : Array ResolvedDeclaration) (suffix : Name)
+    (definedIn? : Option Name := none) : Array ResolvedDeclaration :=
+  index.filter fun candidate =>
+    suffix.isSuffixOf candidate.declaration &&
+      shouldDisplay env candidate.name &&
+      definedIn?.all (· == candidate.definingModule)
+
+/-- Exact user-facing matches, including private declarations with distinct internal names. -/
+def exactUserCandidates
+    (index : Array ResolvedDeclaration) (declName : Name)
+    (definedIn? : Option Name := none) : Array ResolvedDeclaration :=
+  index.filter fun candidate =>
+    candidate.declaration == declName && definedIn?.all (· == candidate.definingModule)
+
+/-- Construct an ambiguity error without ever selecting one candidate silently. -/
+def ambiguousResolution
+    (declName : Name) (mode : String) (found : Array ResolvedDeclaration) : ResolutionFailure :=
+  resolutionFailure "ambiguousDeclaration"
+    s!"{mode} lookup for `{declName}` matched {found.size} declarations" found
+
+/--
+Resolve a declaration target inside an already-loaded query scope.
+
+Unqualified exact lookup retains the historical public-name and scope-module-private behavior.
+`definedIn?` identifies a declaration's actual defining module without changing the imported scope.
+Suffix resolution is explicit and compares `Name` components rather than rendered substrings.
 -/
-def resolveDeclaration (env : Environment) (moduleName rawDeclName : Name) : Except String Name := do
-  if (env.find? rawDeclName).isSome then
-    return rawDeclName
+def resolveDeclaration
+    (env : Environment) (scopeModule rawDeclName : Name) (definedIn? : Option Name := none)
+    (resolveSuffix : Bool := false) : Except ResolutionFailure ResolvedDeclaration := do
   let declName := privateToUserName rawDeclName
-  let privateCandidate := mkPrivateNameCore moduleName declName
-  if (env.find? privateCandidate).isSome then
-    return privateCandidate
-  if (env.find? declName).isSome then
-    return declName
-  throw s!"declaration `{declName}` was not found in the environment of module `{moduleName}`"
+  if resolveSuffix then
+    let index := declarationIndex env
+    let found := suffixCandidates env index declName definedIn?
+    if _h : found.size == 1 then
+      return found[0]!
+    else if found.size > 1 then
+      throw <| ambiguousResolution declName "suffix" found
+    else
+      let globalMatches := suffixCandidates env index declName
+      match definedIn? with
+      | some definingModule =>
+          if globalMatches.isEmpty then
+            throw <| resolutionFailure "declarationNotFound"
+              s!"no declaration with suffix `{declName}` was found in the environment of module `{scopeModule}`" #[]
+          else
+            throw <| resolutionFailure "wrongDefiningModule"
+              s!"no declaration with suffix `{declName}` is defined in module `{definingModule}`" globalMatches
+      | none =>
+          throw <| resolutionFailure "declarationNotFound"
+            s!"no declaration with suffix `{declName}` was found in the environment of module `{scopeModule}`" #[]
+  else if let some definingModule := definedIn? then
+    let index := declarationIndex env
+    let found := exactUserCandidates index declName (some definingModule)
+    if _h : found.size == 1 then
+      return found[0]!
+    else if found.size > 1 then
+      throw <| ambiguousResolution declName "exact module-qualified" found
+    else
+      let exactElsewhere := exactUserCandidates index declName
+      if !exactElsewhere.isEmpty then
+        throw <| resolutionFailure "wrongDefiningModule"
+          s!"declaration `{declName}` is not defined in module `{definingModule}`" exactElsewhere
+      else
+        let suggestions := suffixCandidates env index declName
+        throw <| resolutionFailure "declarationNotFound"
+          s!"declaration `{declName}` was not found in module `{definingModule}` within the environment of module `{scopeModule}`"
+          suggestions
+  else
+    -- Keep the legacy preference order: global exact name, query-module private name, then the
+    -- user-facing name recovered from a supplied internal private encoding.
+    if (env.find? rawDeclName).isSome then
+      return resolvedDeclaration env rawDeclName
+    let privateCandidate := mkPrivateNameCore scopeModule declName
+    if (env.find? privateCandidate).isSome then
+      return resolvedDeclaration env privateCandidate
+    if (env.find? declName).isSome then
+      return resolvedDeclaration env declName
+    let suggestions := suffixCandidates env (declarationIndex env) declName
+    throw <| resolutionFailure "declarationNotFound"
+      s!"declaration `{declName}` was not found in the environment of module `{scopeModule}`" suggestions
 
 /-- Sort names for stable output by associated module, then by user-facing declaration name. -/
 def lessForOutput (env : Environment) (a b : Name) : Bool :=
@@ -567,11 +726,61 @@ def displayableReachable
 def formatDeclaration (env : Environment) (declName : Name) : String :=
   s!"{moduleOfD env declName}\t{privateToUserName declName}"
 
+/-- Machine-readable defining-module-qualified declaration target. -/
+def resolvedDeclarationJson (target : ResolvedDeclaration) : Json :=
+  Json.mkObj [
+    ("definingModule", s!"{target.definingModule}"),
+    ("declaration", s!"{target.declaration}")
+  ]
+
 /-- Format a declaration with its associated module as one compact JSON object. -/
-def formatDeclarationJsonLine (env : Environment) (declName : Name) : String :=
+def formatDeclarationJsonLine
+    (env : Environment) (scopeModule : Name) (target : ResolvedDeclaration)
+    (declName : Name) : String :=
+  let definingModule := moduleOfD env declName
   Json.compress <| Json.mkObj [
-    ("module", s!"{moduleOfD env declName}"),
-    ("declaration", s!"{privateToUserName declName}")
+    ("module", s!"{definingModule}"),
+    ("definingModule", s!"{definingModule}"),
+    ("declaration", s!"{privateToUserName declName}"),
+    ("scopeModule", s!"{scopeModule}"),
+    ("target", resolvedDeclarationJson target)
+  ]
+
+/-- Render one candidate as an unambiguous defining-module-qualified identity. -/
+def formatResolutionCandidate (candidate : ResolvedDeclaration) : String :=
+  s!"{candidate.definingModule}::{candidate.declaration}"
+
+/-- Human-readable lookup failure with deterministic, bounded suggestions. -/
+def formatResolutionFailure (failure : ResolutionFailure) : String :=
+  if failure.candidates.isEmpty then
+    s!"error: {failure.message}"
+  else
+    let candidateLines := failure.candidates.toList.map fun candidate =>
+      s!"  {formatResolutionCandidate candidate}"
+    let omitted := failure.totalCandidates - failure.candidates.size
+    let omittedLine := if omitted == 0 then [] else [s!"  ... and {omitted} more"]
+    s!"error: {failure.message}\nCandidates (<defining-module>::<declaration>):\n{String.intercalate "\n" (candidateLines ++ omittedLine)}"
+
+/-- Structured JSONL lookup error for agent callers. -/
+def formatResolutionFailureJsonLine (config : QueryConfig) (failure : ResolutionFailure) : String :=
+  let definedInJson := match config.definedIn? with
+    | some moduleName => Json.str moduleName
+    | none => Json.null
+  Json.compress <| Json.mkObj [
+    ("type", "error"),
+    ("scopeModule", config.moduleString),
+    ("requestedTarget", Json.mkObj [
+      ("declaration", config.declString),
+      ("definedIn", definedInJson),
+      ("resolution", if config.resolveSuffix then "suffix" else "exact")
+    ]),
+    ("error", Json.mkObj [
+      ("code", failure.code),
+      ("message", failure.message)
+    ]),
+    ("candidateCount", toJson failure.totalCandidates),
+    ("truncated", toJson (decide (failure.totalCandidates > failure.candidates.size))),
+    ("candidates", Json.arr <| failure.candidates.map resolvedDeclarationJson)
   ]
 
 /-- Load `moduleName`, including private module data, so private declarations can participate. -/
@@ -580,39 +789,48 @@ def loadModuleEnvironment (moduleName : Name) : IO Environment := do
   importModules imports Options.empty 0 (leakEnv := true) (loadExts := true) (level := .private)
 
 /-- Run a dependency query and print the result. -/
-def runQuery (kind : QueryKind) (config : QueryConfig) : IO Unit := do
+def runQuery (kind : QueryKind) (config : QueryConfig) : IO UInt32 := do
   let moduleName := config.moduleString.toName
   let rawDeclName := config.declString.toName
+  let definedIn? := config.definedIn?.map String.toName
   let env ← loadModuleEnvironment moduleName
-  let target ← exceptToIO <| resolveDeclaration env moduleName rawDeclName
+  let target ← match resolveDeclaration env moduleName rawDeclName definedIn? config.resolveSuffix with
+    | .ok target => pure target
+    | .error failure =>
+        if config.jsonl then
+          IO.println (formatResolutionFailureJsonLine config failure)
+        else
+          IO.eprintln (formatResolutionFailure failure)
+        return (1 : UInt32)
   let out :=
     match kind with
     | .dependencies =>
-        let reachable := reachableFrom target (directDependencies env)
-        displayableReachable env target config.filter reachable
+        let reachable := reachableFrom target.name (directDependencies env)
+        displayableReachable env target.name config.filter reachable
     | .dependents =>
         let reachable :=
           if config.filter.patterns.isEmpty then
-            let reverse := reverseDependencyMap env (relevantModulesForOutput env target config.filter)
-            reachableFrom target (directDependents reverse)
+            let reverse := reverseDependencyMap env (relevantModulesForOutput env target.name config.filter)
+            reachableFrom target.name (directDependents reverse)
           else
-            match relevantModulesForOutput env target config.filter with
+            match relevantModulesForOutput env target.name config.filter with
             | some relevantModules =>
                 let outputConstCount := constantCountForFilter env config.filter
                 let relevantConstCount := constantCountInModules env (some relevantModules)
                 if useReverseScanForFilteredRdeps outputConstCount relevantConstCount then
                   let reverse := reverseDependencyMap env (some relevantModules)
-                  reachableFrom target (directDependents reverse)
+                  reachableFrom target.name (directDependents reverse)
                 else
-                  dependentReachableViaOutputClosure env target config.filter
+                  dependentReachableViaOutputClosure env target.name config.filter
             | none =>
-                dependentReachableViaOutputClosure env target config.filter
-        displayableReachable env target config.filter reachable
+                dependentReachableViaOutputClosure env target.name config.filter
+        displayableReachable env target.name config.filter reachable
   for declName in out do
     if config.jsonl then
-      IO.println (formatDeclarationJsonLine env declName)
+      IO.println (formatDeclarationJsonLine env moduleName target declName)
     else
       IO.println (formatDeclaration env declName)
+  return (0 : UInt32)
 
 /-- Safe part of the CLI entry point. -/
 def run (args : List String) : IO UInt32 := do
@@ -660,7 +878,6 @@ def run (args : List String) : IO UInt32 := do
               return (0 : UInt32)
           | .ok (some config) =>
               runQuery kind config
-              return (0 : UInt32)
           | .error msg =>
               IO.eprintln s!"error: {msg}\n\n{subcommandHelp kind}"
               return (1 : UInt32)
