@@ -71,10 +71,12 @@ record with `"type":"error"` names the module, the `phase` (`source-resolution`,
 Pass `--allow-partial` only when you have decided that a partial inventory is acceptable, and
 still read the error records. Findings from successful modules are always retained.
 
-Scheduling note: modules are processed in batches of `--jobs`, and a batch waits for its slowest
-member before the next starts; with per-module times ranging from ~5 s to ~100 s the effective
-concurrency is below `--jobs`. Measured: a 155-module Mathlib-dependent library, `--jobs 4`,
-**20 min wall** (667 findings, 0 module failures).
+`--jobs` is a completion-driven bounded queue: at most `--jobs` module scans are in flight and a
+slot is refilled the moment any scan finishes, so uneven module sizes (here ~5 s to ~100 s) do
+not stall the others; output is still emitted in module order. Budget roughly
+(sum of per-module times) / `--jobs`: a 155-module Mathlib-dependent library with `--jobs 4`
+took **9 min** (667 findings, 0 module failures; 4 workers live in 39 of 48 ten-second
+samples), and a second run produced byte-identical `key`s.
 
 **Reading a finding** (`"type":"finding"`): `module`, `file`, `kind`, `description`, a 1-based
 `range`, and
@@ -105,8 +107,8 @@ printf '%s\n' MyLib.Foo.bar "MyLib.Foo.baz'" | lake exe aftk rdeps library MyLib
 ```
 
 - **Batch with `--stdin --jsonl`.** The environment, lookup index and reverse graph are built
-  once and reused: 460 declarations against a 155-module Mathlib-dependent library took **5 s**
-  total, versus ~4 s *each* as separate invocations. Names go one per line; primes and Unicode
+  once and reused: 460 declarations against a 155-module Mathlib-dependent library took **7 s**
+  total in `library` scope (4.2 GB peak), versus ~4 s *each* as separate invocations. Names go one per line; primes and Unicode
   are fine.
 - **Every query gets an explicit `status`**: `ok` (with `results`, `resultCount`,
   `moduleCount`), `leaf` (resolved, **no dependents in the scope**), `unresolved` (with
