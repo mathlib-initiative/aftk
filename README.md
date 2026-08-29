@@ -155,12 +155,11 @@ For large imports such as Mathlib, prefer using module filters with `rdeps`.
 
 [`skills/aftk/SKILL.md`](skills/aftk/SKILL.md) is a self-contained skill for coding agents (Claude
 Code / agentskills format) that use AFTK from a consuming project: a command cheat-sheet, four
-workflows (library-wide debt inventory, declaration-level blast radius and leaf detection, proof
-iteration through the daemon, cross-checking a textual tracker), and the gotchas that are not
-obvious from `--help`. Two helper scripts live next to it: `scripts/scan_modules.sh` (per-module,
-parallel `tech-debt` over a whole library) and `scripts/rdeps_batch.sh` (parallel `rdeps` over a
-list of declaration names). Copy or symlink the directory into a project's `.claude/skills/` to
-make it available there.
+workflows (library-wide debt inventory with `--jobs`, declaration-level blast radius and leaf
+detection with batched `rdeps --stdin --jsonl`, proof iteration through the daemon, cross-checking
+a textual tracker by `key`), and the contracts that are easy to get wrong (scopes, exit status,
+UTF-16 columns). Copy or symlink the directory into a project's `.claude/skills/` to make it
+available there.
 
 ## Technical-debt detection
 
