@@ -1212,30 +1212,42 @@ def scanIsolatedModule (config : Config) (moduleName : Name) : IO IsolatedScan :
       succeeded := false
     }
 
-/-- Run isolated module workers in bounded batches while preserving sorted module order. -/
-partial def scanIsolatedModules (config : Config) (moduleNames : List Name) :
+/-- Convert an unexpected task runtime failure into an ordinary isolated-scan failure. -/
+def runtimeFailureScan (config : Config) (moduleName : Name) (error : IO.Error) : IsolatedScan :=
+  let failure : ModuleFailure := { moduleName, phase := .internal, diagnostic := toString error }
+  {
+    moduleName
+    stdout := if config.jsonl then formatFailureJsonLine failure ++ "\n" else ""
+    stderr := if config.jsonl then "" else formatFailure failure ++ "\n"
+    succeeded := false
+  }
+
+/-- Run at most `config.jobs` isolated workers, refilling each slot as soon as one finishes. -/
+def scanIsolatedModules (config : Config) (moduleNames : List Name) :
     IO (Array IsolatedScan) := do
-  if moduleNames.isEmpty then
-    return #[]
-  let (batch, rest) := moduleNames.splitAt config.jobs
-  let mut tasks := #[]
-  for moduleName in batch do
-    tasks := tasks.push (← IO.asTask (scanIsolatedModule config moduleName))
-  let mut results := #[]
-  for task in tasks do
-    match ← IO.wait task with
-    | .ok result => results := results.push result
-    | .error e =>
-        -- `scanIsolatedModule` catches its own IO errors, so this indicates a runtime failure.
-        let moduleName := batch[results.size]!
-        let failure : ModuleFailure := { moduleName, phase := .internal, diagnostic := toString e }
-        results := results.push {
-          moduleName
-          stdout := if config.jsonl then formatFailureJsonLine failure ++ "\n" else ""
-          stderr := if config.jsonl then "" else formatFailure failure ++ "\n"
-          succeeded := false
-        }
-  return results ++ (← scanIsolatedModules config rest)
+  if config.jobs == 0 then
+    throw <| IO.userError "tech-debt job count must be at least 1"
+  let modules := moduleNames.toArray
+  let mut nextIndex := 0
+  let mut running : List (Task (Nat × Name × Except IO.Error IsolatedScan)) := []
+  let mut completed : Array (Nat × IsolatedScan) := #[]
+  while nextIndex < modules.size || !running.isEmpty do
+    while nextIndex < modules.size && running.length < config.jobs do
+      let index := nextIndex
+      let moduleName := modules[index]!
+      let task ← IO.asTask (scanIsolatedModule config moduleName)
+      running := task.map (sync := true) (fun result => (index, moduleName, result)) :: running
+      nextIndex := nextIndex + 1
+    match running with
+    | [] => pure ()
+    | task :: tasks =>
+        let ((index, moduleName, result), remaining) ← IO.waitAny' (task :: tasks)
+        let result := match result with
+          | .ok result => result
+          | .error error => runtimeFailureScan config moduleName error
+        completed := completed.push (index, result)
+        running := remaining
+  return (completed.qsort fun a b => a.1 < b.1).map (·.2)
 
 /-- Run the `tech-debt` command and return a status reflecting partial module failures. -/
 def run (config : Config) : IO UInt32 := do

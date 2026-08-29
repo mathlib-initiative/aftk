@@ -28,6 +28,10 @@ path = "aftk-dependency"
 name = "partial_fixture"
 path = "partial-fixture"
 
+[[require]]
+name = "scheduler_fixture"
+path = "scheduler-fixture"
+
 [[lean_lib]]
 name = "TechDebtTest"
 
@@ -407,6 +411,57 @@ module
 
 -- This file is under srcDir but deliberately outside the library's configured roots.
 set_option maxHeartbeats 999999
+EOF
+mkdir -p "$PROJECT/scheduler-fixture/CustomSource/SchedulerDebt"
+cat > "$PROJECT/scheduler-fixture/lakefile.toml" <<'EOF'
+name = "scheduler_fixture"
+version = "0.1.0"
+
+[[lean_lib]]
+name = "SchedulerDebt"
+srcDir = "CustomSource"
+roots = ["SchedulerDebt.ABlock", "SchedulerDebt.BFast", "SchedulerDebt.CSignal"]
+EOF
+cp "$ROOT/lean-toolchain" "$PROJECT/scheduler-fixture/lean-toolchain"
+cat > "$PROJECT/scheduler-fixture/CustomSource/SchedulerDebt/ABlock.lean" <<'EOF'
+module
+public import Lean
+
+-- With two worker slots, this first module can finish only if the scheduler starts CSignal as
+-- soon as BFast completes. A barrier between fixed pairs instead times out here.
+run_cmd do
+  let some signalPath ← IO.getEnv "AFTK_SCHEDULER_TEST_SIGNAL"
+    | throwError "missing scheduler-test signal path"
+  let signal := System.FilePath.mk signalPath
+  for _ in [0:200] do
+    if ← signal.pathExists then
+      return
+    IO.sleep 25
+  throwError "timed out waiting for the scheduler to refill its free worker slot"
+
+set_option maxHeartbeats 111111
+
+def blockedUntilRefill : Nat := 1
+EOF
+cat > "$PROJECT/scheduler-fixture/CustomSource/SchedulerDebt/BFast.lean" <<'EOF'
+module
+
+set_option maxHeartbeats 222222
+
+def finishesFirst : Nat := 2
+EOF
+cat > "$PROJECT/scheduler-fixture/CustomSource/SchedulerDebt/CSignal.lean" <<'EOF'
+module
+public import Lean
+
+run_cmd do
+  let some signalPath ← IO.getEnv "AFTK_SCHEDULER_TEST_SIGNAL"
+    | throwError "missing scheduler-test signal path"
+  IO.FS.writeFile (System.FilePath.mk signalPath) "started\n"
+
+set_option maxHeartbeats 333333
+
+def startsAfterFastWorker : Nat := 3
 EOF
 (cd "$PROJECT" && lake build)
 
@@ -837,6 +892,31 @@ failure = records[1]
 assert failure["phase"] == "elaboration", failure
 assert "unknownIdentifier" in failure["diagnostic"], failure
 assert all(record["module"] != "PartialDebt.Orphan" for record in records), records
+PY
+
+printf 'test: tech-debt refills worker slots without a batch barrier\n'
+SCHEDULER_SIGNAL="$PROJECT/scheduler-worker-started"
+if ! (cd "$PROJECT" && AFTK_SCHEDULER_TEST_SIGNAL="$SCHEDULER_SIGNAL" \
+    lake exe aftk tech-debt --jsonl --jobs 2 --markers maxHeartbeats \
+      library SchedulerDebt > scheduler.jsonl); then
+  echo 'bounded scheduler did not start the next module when one worker slot became free' >&2
+  cat "$PROJECT/scheduler.jsonl" >&2
+  exit 1
+fi
+[[ -f "$SCHEDULER_SIGNAL" ]]
+python3 - "$PROJECT/scheduler.jsonl" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    records = [json.loads(line) for line in stream if line.strip()]
+
+assert [(record["module"], record["type"]) for record in records] == [
+    ("SchedulerDebt.ABlock", "finding"),
+    ("SchedulerDebt.BFast", "finding"),
+    ("SchedulerDebt.CSignal", "finding"),
+], records
+assert [record["kind"] for record in records] == ["maxHeartbeats"] * 3, records
 PY
 
 printf 'test: tech-debt allows explicit partial success for library and package scopes\n'
