@@ -20,6 +20,10 @@ defaultTargets = ["Discovery", "SplitWorkspace", "DownstreamWorkspace"]
 name = "aftk"
 path = "aftk-dependency"
 
+[[require]]
+name = "config_dependency"
+path = "config-dependency"
+
 [[lean_lib]]
 name = "Discovery"
 
@@ -34,7 +38,27 @@ roots = ["Workspace.Downstream"]
 EOF
 ln -s "$ROOT" "$PROJECT/aftk-dependency"
 cp "$ROOT/lean-toolchain" "$PROJECT/lean-toolchain"
-mkdir -p "$PROJECT/Discovery"
+mkdir -p "$PROJECT/Discovery" "$PROJECT/config-dependency"
+
+# Loading a dependency configured by `lakefile.lean` imports Lean modules while resolving the
+# workspace. Lean's import boundary resets the initializer-execution flag, so the later scoped
+# dependency-graph import must restore that flag itself.
+cat > "$PROJECT/config-dependency/lakefile.lean" <<'EOF'
+import Lake
+
+open Lake DSL
+
+package config_dependency
+
+lean_lib ConfigDependency
+EOF
+cat > "$PROJECT/config-dependency/ConfigDependency.lean" <<'EOF'
+module
+
+public section
+
+def configDependencyValue : Nat := 1
+EOF
 
 cat > "$PROJECT/Discovery/A.lean" <<'EOF'
 module
@@ -185,7 +209,7 @@ assert [(item["module"], item["declaration"]) for item in row["results"]] == [
 ]
 PY
 
-printf 'test: library scope imports every configured root without an umbrella module\n'
+printf 'test: library scope survives lakefile.lean loading and imports every configured root\n'
 (cd "$PROJECT" && lake exe aftk rdeps library SplitWorkspace Workspace.seed \
   --jsonl > library-scope.jsonl)
 python3 - "$PROJECT/library-scope.jsonl" <<'PY'

@@ -914,6 +914,10 @@ def loadModulesEnvironment (moduleNames : Array Name) : IO Environment := do
   if moduleNames.isEmpty then
     throw <| IO.userError "the selected query scope contains no Lean modules"
   let imports : Array Import := moduleNames.map fun moduleName => { module := moduleName }
+  -- Resolving a Lake workspace may import a `lakefile.lean`. Lean's `withImporting` resets the
+  -- initializer-execution flag when that import finishes, so establish the precondition again at
+  -- the boundary where AFTK imports the query environment with extensions enabled.
+  unsafe Lean.enableInitializersExecution
   importModules imports Options.empty 0 (leakEnv := true) (loadExts := true) (level := .private)
 
 /-- Load `moduleName`, including private module data, so private declarations can participate. -/
