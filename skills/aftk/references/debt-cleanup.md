@@ -95,7 +95,7 @@ Traps:
   Test the demoted `rw` in context. Conversely, `with_implicit rw` can match where plain `rw`
   fails, so compile the unwrapped text as well.
 - *Term elaboration can pass through the outer wrapper.* Both of these proofs compile on
-  Lean v4.33 with the flag forced on:
+  Lean v4.33 and v4.34.1 with the flag forced on:
 
   ```lean
   def hiddenNat : Nat := 0
