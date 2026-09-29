@@ -216,3 +216,7 @@ should treat the key as opaque and partition persisted state by `keyVersion`.
 JSONL records have `type` set to `finding` or `error`. Error records include the failed `module`,
 the `phase` (`source-resolution`, `parse`, `header`, `elaboration`, or `internal`), and a
 `diagnostic`. In the default text format, module failures are written to standard error.
+
+## License
+
+AFTK is licensed under the [Apache License, Version 2.0](LICENSE).
